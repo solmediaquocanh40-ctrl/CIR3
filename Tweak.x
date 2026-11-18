@@ -12,9 +12,9 @@
 #import "CSGlassShader.h"
 
 // ============================================================================
-// CircleSwitcher v2.2.7 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
+// CircleSwitcher v2.2.9 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
 // Supports iOS 14.0 - 16.3.1+ (Rootless & Rootful)
-// Critical Stability Fixes (v2.2.7):
+// Critical Stability Fixes (v2.2.9):
 //   - REMOVED drawViewHierarchyInRect: (eliminates GPU/WindowServer deadlock on iOS 16)
 //   - REMOVED viewDidLayoutSubviews mutation & recursive layoutSubviews loops
 //   - NEVER activates mid-swipe (only activates after transitionDidEnd into mode 2)
@@ -48,7 +48,9 @@
 - (void)_cs_handlePrefsOrStateChanged;
 - (void)_cs_setSwitcherActive:(BOOL)active;
 - (void)_cs_dismissSwitcherToHome;
-- (void)_cs_scheduleExitWatchdog;
+- (BOOL)_cs_sendHomeToggleCommand;
+- (void)_cs_scheduleExitWatchdogAllowingRetry:(BOOL)allowRetry;
+- (void)_cs_exitWatchdogFiredWithToken:(CFTimeInterval)token attempt:(NSInteger)attempt allowRetry:(BOOL)allowRetry;
 - (void)_cs_runExitGuardLoop;
 - (void)_cs_exitGuardStepWithToken:(CFTimeInterval)token passesLeft:(NSInteger)passesLeft;
 - (void)_cs_activateAppLayout:(id)appLayout bundleID:(NSString *)bundleID;
@@ -68,6 +70,7 @@ static BOOL kInfiniteScroll = YES;
 static BOOL kCircleMorph = NO;
 static CGFloat kCircleRadius = 34.0;
 static CGFloat kWheelCurvature = 1.05;
+static CGFloat kTiltAmount = 1.0; // 2.2.8: user-adjustable icon tilt (overlay modes 0-2)
 static CGFloat kCardScale = 0.86;
 static CGFloat kOrbSize = 0.72;
 static CGFloat kCardSpacing = 1.05;
@@ -332,6 +335,7 @@ static void CSLoadPreferences(void) {
     kCircleMorph         = prefs[@"circleMorph"]         ? [prefs[@"circleMorph"] boolValue]         : NO;
     kCircleRadius        = prefs[@"circleRadius"]        ? [prefs[@"circleRadius"] doubleValue]      : 34.0;
     kWheelCurvature      = prefs[@"wheelCurvature"]      ? [prefs[@"wheelCurvature"] doubleValue]    : 1.05;
+    kTiltAmount          = prefs[@"tiltAmount"]          ? [prefs[@"tiltAmount"] doubleValue]       : 1.0;
     kCardScale           = prefs[@"cardScale"]           ? [prefs[@"cardScale"] doubleValue]         : 0.86;
     kOrbSize             = prefs[@"orbSize"]             ? [prefs[@"orbSize"] doubleValue]           : 0.72;
     kCardSpacing         = prefs[@"cardSpacing"]         ? [prefs[@"cardSpacing"] doubleValue]       : 1.05;
@@ -845,6 +849,8 @@ typedef struct {
 @property (nonatomic, strong) UIColor *savedPillColor;
 @property (nonatomic, strong) UIColor *savedCloseColor;
 @property (nonatomic, assign) BOOL dismissPending; // exit requested: taps ignored, carousel stays alive
+@property (nonatomic, assign) BOOL activationAnimPending; // 2.2.9: app activation sent; fade/expand waits for transitionDidBegin
+@property (nonatomic, assign) CFTimeInterval activationAnimToken;
 @property (nonatomic, assign) BOOL morphUsesGlass;
 @property (nonatomic, strong) CADisplayLink *expandDisplayLink;
 @property (nonatomic, assign) CFTimeInterval expandStartTime;
@@ -863,6 +869,7 @@ typedef struct {
 - (void)_cs_setGlassActive:(BOOL)active;
 - (void)_cs_beginAppExpand;
 - (void)_cs_stopAppExpand;
+- (void)_cs_runActivationAnimation;
 @end
 
 @implementation CSInfiniteCarouselStageView
@@ -1126,7 +1133,7 @@ typedef struct {
 
 - (void)morphTick:(CADisplayLink *)link {
     if (self.morphUsesGlass) {
-        double p = (CACurrentMediaTime() - self.morphStartTime) / 0.55;
+        double p = (CACurrentMediaTime() - self.morphStartTime) / 0.42;
         if (p >= 1.0) { [self finishEntranceMorph]; return; }
         if (p < 0.0) p = 0.0;
         double e = (p < 0.5) ? (4.0 * p * p * p) : (1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0);
@@ -1149,7 +1156,7 @@ typedef struct {
     }
     UIView *morph = self.entranceMorphView;
     if (!morph) { [self finishEntranceMorph]; return; }
-    double p = (CACurrentMediaTime() - self.morphStartTime) / 0.55;
+    double p = (CACurrentMediaTime() - self.morphStartTime) / 0.42;
     if (p >= 1.0) { [self finishEntranceMorph]; return; }
     if (p < 0.0) p = 0.0;
     double e = (p < 0.5) ? (4.0 * p * p * p) : (1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0);
@@ -1400,7 +1407,11 @@ typedef struct {
     UIColor *glowCol = CSActiveGlowColor(1.0);
     UIColor *baseCol = CSActiveBaseColor(1.0);
 
-    self.ambientBackdropView.hidden = !kBackdropEnabled;
+    // 2.2.8: the ambient backdrop is a concentric-oval-rings graphic. While the
+    // real-glass engine is live the items are transparent, so the rings showed
+    // through as a big grey circle around the apps (the user's 2.2.7 test
+    // photo) - the glass needs no backdrop art behind it, so it is hidden then.
+    self.ambientBackdropView.hidden = !kBackdropEnabled || self.glassActive;
     self.ambientBackdropView.tintColor = [glowCol colorWithAlphaComponent:0.16 * MAX(0.25, kGlowIntensity)];
 
     // HOLOGRAM BASE REMOVED (user's order, 2026-11-18): the composite base with its
@@ -1545,14 +1556,14 @@ typedef struct {
             posX = (w * 0.5) + cylR * sinT;
             posY = (h * 0.47) - (1.0 - cosT) * 24.0;
             transZ = (cosT - 1.0) * 185.0 * kWheelCurvature;
-            angleY = -theta * 0.78 * kWheelCurvature;
+            angleY = -theta * 0.78 * kWheelCurvature * kTiltAmount;
             depthScale = 0.62 + 0.38 * frontWeight;
         } else if (kLayoutMode == 2) {
             CGFloat orbitR = (w * 0.46) * kCardSpacing;
             posX = (w * 0.5) + orbitR * sinT;
             posY = (h * 0.48) + (1.0 - cosT) * 18.0;
             transZ = (cosT - 1.0) * 145.0 * kWheelCurvature;
-            angleY = -sinT * 0.52 * kWheelCurvature;
+            angleY = -sinT * 0.52 * kWheelCurvature * kTiltAmount;
             depthScale = 0.72 + 0.28 * frontWeight;
         } else {
             CGFloat ringR = MIN(w, h) * 0.34 * kCardSpacing;
@@ -1851,6 +1862,26 @@ typedef struct {
     [self.expandDisplayLink invalidate];
     self.expandDisplayLink = nil;
     if (!self.morphUsesGlass) self.glassView.overrideIndex = -1;
+}
+
+- (void)_cs_runActivationAnimation {
+    // 2.2.9: the app-open fade (and the glass expand, when live) runs from HERE,
+    // called at the moment the system's exit transition actually begins - not
+    // from the tap. Up to 2.2.8 the fade started on the tweak's own clock at
+    // tap time while SpringBoard's zoom started whenever it got there; the two
+    // clocks drifting apart is what read as a jerk at the seam. Runs at most
+    // once per activation (the pending flag is the latch).
+    if (!self.activationAnimPending) return;
+    self.activationAnimPending = NO;
+    if (self.hidden) return;
+    BOOL expanding = NO;
+    if (self.glassActive) {
+        [self _cs_beginAppExpand];
+        expanding = self.expandActive;
+    }
+    [UIView animateWithDuration:(expanding ? 0.32 : 0.25) delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+        self.alpha = 0.0;
+    } completion:nil];
 }
 
 - (void)physicsTick:(CADisplayLink *)link {
@@ -2182,9 +2213,21 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         self.layer.masksToBounds = YES;
     }
 
-    if (kLiquidGlass && kGlowIntensity > 0.01) {
-        self.layer.borderWidth = 2.0;
-        self.layer.borderColor = CSActiveGlowColor(MIN(0.95, 0.40 + kGlowIntensity * 0.55)).CGColor;
+    if (kLiquidGlass && kGlowIntensity > 0.01 && parentContainer) {
+        // 2.2.8: ONE border at a time in classic too (the user's standing rule
+        // from the overlay modes): the border fades in only as this card nears
+        // the front, using the same centre-distance math as
+        // _cs_applyClassicTransform. Rear cards are borderless, so borders can
+        // no longer stack across the coverflow and fake a 'covering' layer.
+        UIWindow *csWin = self.window;
+        CGFloat screenW = csWin ? csWin.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
+        if (screenW <= 0) screenW = 390.0;
+        CGPoint centerInScreen = [parentContainer.superview convertPoint:parentContainer.center toView:csWin];
+        CGFloat bt = ((centerInScreen.x - (screenW * 0.5)) / (screenW * 0.54)) / MAX(0.45, kCardSpacing);
+        CGFloat absBT = fabs(MAX(-1.8, MIN(1.8, bt)));
+        CGFloat frontFactor = MAX(0.0, MIN(1.0, (0.45 - absBT) / 0.30));
+        self.layer.borderWidth = 2.0 * frontFactor;
+        self.layer.borderColor = [CSActiveGlowColor(MIN(0.95, 0.40 + kGlowIntensity * 0.55)) colorWithAlphaComponent:frontFactor].CGColor;
     } else {
         self.layer.borderWidth = 0.0;
     }
@@ -2375,6 +2418,10 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     }
 
     if (!kScaleIcons) scale = kCardScale;
+    // 2.2.8: the front card shrinks up to 6% (the factor eases out with
+    // distance and is continuous in absT, so nothing pops while scrolling),
+    // which directly reduces how much of the card behind it gets covered.
+    scale *= 1.0 - 0.06 * MAX(0.0, 1.0 - absT);
     if (kRollIcons) angleZ += clampedT * 0.06;
 
     transform = CATransform3DTranslate(transform, 0.0, transY, transZ);
@@ -2386,7 +2433,10 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     }
     transform = CATransform3DScale(transform, scale, scale, 1.0);
     targetView.layer.transform = transform;
-    targetView.alpha = kFadeIcons ? MAX(0.50, 1.0 - absT * 0.35) : 1.0;
+    // 2.2.8: rear cards fade much less (floor 0.68 instead of 0.50, gentler
+    // slope) so they read as real cards behind the front one, not as dark
+    // silhouettes being 'covered' by it.
+    targetView.alpha = kFadeIcons ? MAX(0.68, 1.0 - absT * 0.22) : 1.0;
     if (kTitlePosition == 1) targetView.alpha *= 0.78; // 'center (dim card)' behind our own title label
 
     // 2.2.5: repositioning the native header never survived the system's own layout
@@ -2521,6 +2571,9 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
                 if (stage && !stage.hidden) {
                     CSSetNativeSwitcherViewsHidden(self.view, stage, YES);
                     [self _cs_runExitGuardLoop];
+                    // 2.2.9: if this exit is an app activation, the fade/expand
+                    // starts NOW - the same moment the system's own zoom starts.
+                    if (stage.activationAnimPending) [stage _cs_runActivationAnimation];
                 }
             }
             // Leaving the switcher (to Home=1 or App=3): do NOT tear anything down here.
@@ -2593,6 +2646,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             BOOL wasHidden = stage.hidden;
             stage.hidden = NO;
             stage.alpha = 1.0;
+            stage.carouselContentLayer.transform = CGAffineTransformIdentity; // clear any dismiss press-down
             kCSLastActivationTime = CACurrentMediaTime();
             stage.userInteractionEnabled = YES;
             stage.dismissPending = NO;
@@ -2628,6 +2682,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             [stage stopPhysics];
             [stage _cs_setGlassActive:NO];
             stage.dismissPending = NO;
+            stage.activationAnimPending = NO;
             [stage.backdropView removeFromSuperview];
             stage.hidden = YES;
             stage.alpha = 0.0;
@@ -2654,13 +2709,17 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 - (void)_cs_runExitGuardLoop {
     CFTimeInterval token = CACurrentMediaTime();
     kCSExitGuardToken = token;
-    [self _cs_exitGuardStepWithToken:token passesLeft:30];
+    [self _cs_exitGuardStepWithToken:token passesLeft:15];
 }
 
 %new
 - (void)_cs_exitGuardStepWithToken:(CFTimeInterval)token passesLeft:(NSInteger)passesLeft {
-    // ~40ms re-hide passes for the length of a typical exit (30 passes ≈ 1.2s cap,
-    // so the loop can never outlive its transition even if DidEnd is somehow missed).
+    // 2.2.9: gentler cadence - ~80ms re-hide passes (15 passes ≈ the same 1.2s
+    // cap, so the loop can never outlive its transition even if DidEnd is
+    // somehow missed). The 40ms cadence woke the main queue 25x/second through
+    // every exit for no extra safety: the native views are already hidden by
+    // the pass in transitionDidBegin itself, and the stage is only re-fronted
+    // when something actually covered it.
     if (!gCSExitInProgress || token != kCSExitGuardToken || passesLeft <= 0) return;
     CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
     if (stage && !stage.hidden) {
@@ -2669,23 +2728,51 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             [self.view bringSubviewToFront:stage];
         }
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self _cs_exitGuardStepWithToken:token passesLeft:passesLeft - 1];
     });
 }
 
 %new
+- (BOOL)_cs_sendHomeToggleCommand {
+    BOOL sent = NO;
+    @try {
+        for (NSString *clsName in @[@"SBMainSwitcherControllerCoordinator", @"SBMainSwitcherViewController"]) {
+            Class cls = NSClassFromString(clsName);
+            if (!cls || ![cls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) continue;
+            id inst = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
+            SEL toggleSel = NSSelectorFromString(@"toggleMainSwitcherNoninteractivelyWithSource:");
+            if (inst && [inst respondsToSelector:toggleSel]) {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(inst, toggleSel, 0);
+                sent = YES;
+                break;
+            }
+        }
+    } @catch (NSException *e) {}
+    return sent;
+}
+
+%new
 - (void)_cs_dismissSwitcherToHome {
-    // 2.2.7: do NOT freeze the stage at tap time, and do NOT mark the switcher
-    // closed yet. 2.2.6 stopped the physics and cut interaction instantly, then
-    // waited for the system to begin its exit — that frozen gap read as lag
-    // ("tạm được, nhưng hơi lag"). The stage now stays fully alive until the
-    // exit transition actually begins; dismissPending makes the tap handler
-    // ignore further taps meanwhile so nothing can race the exit, and
-    // gSwitcherSettledOpen stays YES (headers stay hidden, watchdog semantics
-    // unchanged) until transitionDidEnd settles it.
+    // 2.2.8: back to the exact exit semantics of 2.2.6 — the last version the
+    // user confirmed tap-to-exit WORKED on his device: mark closed, freeze the
+    // stage, cut interaction, THEN send the home command; teardown stays owned
+    // by transitionDidEnd. The 2.2.7 experiment (stage kept alive + interactive
+    // + physics running while the command was sent) broke tap-to-exit entirely
+    // on his iOS 16.3.1, so it is reverted outright. The old 'frozen gap' lag
+    // is softened WITHOUT touching the exit mechanics: a 0.1s press-down scale
+    // on the carousel content acknowledges the tap instantly (its transform is
+    // reset on the next activation and on watchdog restore).
+    gSwitcherSettledOpen = NO;
     CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
-    if (stage) stage.dismissPending = YES;
+    if (stage) {
+        stage.dismissPending = YES;
+        [UIView animateWithDuration:0.1 animations:^{
+            stage.carouselContentLayer.transform = CGAffineTransformMakeScale(0.99, 0.99);
+        }];
+        [stage stopPhysics];
+        stage.userInteractionEnabled = NO;
+    }
 
     BOOL sentHome = NO;
     @try {
@@ -2701,19 +2788,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
                 }
             }
         }
-        if (!sentHome) {
-            for (NSString *clsName in @[@"SBMainSwitcherControllerCoordinator", @"SBMainSwitcherViewController"]) {
-                Class cls = NSClassFromString(clsName);
-                if (!cls || ![cls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) continue;
-                id inst = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
-                SEL toggleSel = NSSelectorFromString(@"toggleMainSwitcherNoninteractivelyWithSource:");
-                if (inst && [inst respondsToSelector:toggleSel]) {
-                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(inst, toggleSel, 0);
-                    sentHome = YES;
-                    break;
-                }
-            }
-        }
+        if (!sentHome) sentHome = [self _cs_sendHomeToggleCommand];
     } @catch (NSException *e) {}
 
     if (sentHome) {
@@ -2721,7 +2796,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         // the whole exit animation and is hidden only once the switcher is off-screen.
         // (The 2.2.5 version tore down on a 0.30s timer here, which could also fire
         // after a fast re-open and kill the fresh stage.)
-        [self _cs_scheduleExitWatchdog];
+        [self _cs_scheduleExitWatchdogAllowingRetry:YES];
     } else {
         // 2.2.6: NEVER reveal the stock switcher as a fallback. The old code called
         // _cs_setSwitcherActive:NO here, restoring the native views on the spot - so
@@ -2732,6 +2807,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         gSwitcherSettledOpen = YES;
         if (stage && !stage.hidden) {
             stage.dismissPending = NO;
+            stage.carouselContentLayer.transform = CGAffineTransformIdentity;
             stage.userInteractionEnabled = YES;
             [stage startPhysicsIfNeeded];
         }
@@ -2739,26 +2815,43 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 }
 
 %new
-- (void)_cs_scheduleExitWatchdog {
+- (void)_cs_scheduleExitWatchdogAllowingRetry:(BOOL)allowRetry {
     kCSLastExitRequestTime = CACurrentMediaTime();
     CFTimeInterval token = kCSLastExitRequestTime;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (kCSLastExitRequestTime != token) return; // a newer exit/open superseded this one
-        if (gCSExitInProgress) return;              // exit under way; DidEnd owns teardown
-        if (!gSwitcherSettledOpen) return;           // the transition ran; DidEnd cleaned up
-        // The exit never actually started (command swallowed): give the switcher back
-        // instead of leaving a frozen (or faded-out, after a failed app activation)
-        // overlay on screen.
-        CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
-        if (stage && !stage.hidden) {
-            stage.dismissPending = NO;
-            stage.userInteractionEnabled = YES;
-            [stage startPhysicsIfNeeded];
-            if (stage.alpha < 1.0) {
-                [UIView animateWithDuration:0.15 animations:^{ stage.alpha = 1.0; }];
-            }
-        }
+        [self _cs_exitWatchdogFiredWithToken:token attempt:1 allowRetry:allowRetry];
     });
+}
+
+%new
+- (void)_cs_exitWatchdogFiredWithToken:(CFTimeInterval)token attempt:(NSInteger)attempt allowRetry:(BOOL)allowRetry {
+    if (kCSLastExitRequestTime != token) return; // a newer exit/open superseded this one
+    if (gCSExitInProgress) return;              // exit under way; DidEnd owns teardown
+    CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
+    if (!stage || stage.hidden) return;          // teardown already happened; nothing to save
+    // The stage is still on screen and no exit transition ever began: the home /
+    // activation command was swallowed. The stage's visibility is the ground
+    // truth here (2.2.7 keyed this off gSwitcherSettledOpen, which the restored
+    // 2.2.6 dismiss semantics clear at tap time, so that check can never fire).
+    if (allowRetry && attempt < 2) {
+        // One retry through the coordinator toggle path before giving up.
+        [self _cs_sendHomeToggleCommand];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self _cs_exitWatchdogFiredWithToken:token attempt:attempt + 1 allowRetry:allowRetry];
+        });
+        return;
+    }
+    // Give the switcher back instead of leaving a frozen (or faded-out, after a
+    // failed app activation) overlay on screen.
+    stage.dismissPending = NO;
+    stage.activationAnimPending = NO;
+    stage.carouselContentLayer.transform = CGAffineTransformIdentity;
+    stage.userInteractionEnabled = YES;
+    [stage startPhysicsIfNeeded];
+    if (stage.alpha < 1.0) {
+        [UIView animateWithDuration:0.15 animations:^{ stage.alpha = 1.0; }];
+    }
+    gSwitcherSettledOpen = YES;
 }
 
 %new
@@ -2775,7 +2868,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         [stage stopPhysics];
         stage.userInteractionEnabled = NO;
     }
-    [self _cs_scheduleExitWatchdog];
+    [self _cs_scheduleExitWatchdogAllowingRetry:NO];
 
     BOOL activated = NO;
     @try {
@@ -2809,24 +2902,22 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         } @catch (NSException *e) {}
     }
 
-    // 2.2.6: fade the stage out over ~0.2s as the app takes over. Previously the
-    // stage stayed frozen at full opacity for the entire exit and then vanished in
-    // a single hard cut at transitionDidEnd - a visible jerk on every app open.
-    // If the activation silently failed, no exit transition begins and the exit
-    // watchdog restores the stage's alpha and interactivity instead (see
-    // _cs_scheduleExitWatchdog), so the user is never stranded on a faded overlay.
-    // 2.2.7: with the glass engine live, the front item's glass shape also grows
-    // to fill the screen across a slightly longer fade, so the open reads as one
-    // object expanding into the app instead of a fade racing the system's zoom.
+    // 2.2.9: the fade/expand no longer starts here. It is armed and fired by
+    // _cs_runActivationAnimation when the system's exit transition begins (see
+    // the transitionDidBegin hook), so the tweak's animation and SpringBoard's
+    // app zoom share one start time. A 0.25s fallback covers any activation
+    // path whose transition begin this hook does not see; if the activation
+    // silently failed altogether, no animation runs and the exit watchdog
+    // restores the stage untouched.
     if (stage && !stage.hidden) {
-        BOOL expanding = NO;
-        if (stage.glassActive) {
-            [stage _cs_beginAppExpand];
-            expanding = stage.expandActive;
-        }
-        [UIView animateWithDuration:(expanding ? 0.32 : 0.2) delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
-            stage.alpha = 0.0;
-        } completion:nil];
+        stage.activationAnimPending = YES;
+        CFTimeInterval token = CACurrentMediaTime();
+        stage.activationAnimToken = token;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (stage.activationAnimPending && stage.activationAnimToken == token) {
+                [stage _cs_runActivationAnimation];
+            }
+        });
     }
 }
 

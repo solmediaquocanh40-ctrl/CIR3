@@ -252,6 +252,30 @@
 			<key>height</key>
 			<integer>74</integer>
 			<key>sliderTitle</key>
+			<string>Độ nghiêng icon</string>
+			<key>key</key>
+			<string>tiltAmount</string>
+			<key>defaults</key>
+			<string>com.vn.circleswitcher</string>
+			<key>min</key>
+			<real>0.0</real>
+			<key>max</key>
+			<real>1.5</real>
+			<key>default</key>
+			<real>1.0</real>
+			<key>valueFormat</key>
+			<string>%.2f</string>
+			<key>PostNotification</key>
+			<string>com.vn.circleswitcher/ReloadPrefs</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSStaticTextCell</string>
+			<key>cellClass</key>
+			<string>CSCircleSwitcherLabeledSliderCell</string>
+			<key>height</key>
+			<integer>74</integer>
+			<key>sliderTitle</key>
 			<string>Kích thước thẻ chính (Card Scale)</string>
 			<key>key</key>
 			<string>cardScale</string>
@@ -730,7 +754,7 @@
 			<key>label</key>
 			<string>ÁP DỤNG &amp; KHỞI ĐỘNG LẠI</string>
 			<key>footerText</key>
-			<string>CircleSwitcher v2.2.7 — Rootless &amp; Rootful (iOS 14 - 16.3.1+)</string>
+			<string>CircleSwitcher v2.2.9 — Rootless &amp; Rootful (iOS 14 - 16.3.1+)</string>
 		</dict>
 		<dict>
 			<key>cell</key>

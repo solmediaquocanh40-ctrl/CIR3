@@ -1,6 +1,6 @@
-# CircleSwitcher v2.2.7 (3D Hologram Cylinder, Orbital Orbs & Liquid Glass)
+# CircleSwitcher v2.2.9 (3D Hologram Cylinder, Orbital Orbs & Liquid Glass)
 
-## Tính năng nổi bật (v2.2.7)
+## Tính năng nổi bật (v2.2.9)
 - **Đầy đủ chế độ 3D & Icon Tròn:**
   - `0`: Vòng Trụ Thẻ 3D (3D Hologram Cylinder — Carousel Cards)
   - `1`: Icon Tròn Vòng Trụ 3D (3D Cylindrical Orbs — Đứng thẳng xoay quanh trụ)
@@ -16,7 +16,7 @@
 
 ## Cách build tự động trên GitHub Actions
 1. Đẩy toàn bộ các file và thư mục (bao gồm `.github/workflows/build.yml`) lên repository GitHub.
-2. Vào tab **Actions** -> chọn **Build CircleSwitcher 2.2.7 (.deb)** -> bấm **Run workflow**.
+2. Vào tab **Actions** -> chọn **Build CircleSwitcher 2.2.9 (.deb)** -> bấm **Run workflow**.
 3. Tải gói `.deb` tại mục **Artifacts**:
-   - `CircleSwitcher-2.2.7-Rootless-deb` (iOS 15 - 16.3.1+ Rootless / Dopamine / Palera1n)
-   - `CircleSwitcher-2.2.7-Rootful-deb` (iOS 14 - 15 Rootful)
+   - `CircleSwitcher-2.2.9-Rootless-deb` (iOS 15 - 16.3.1+ Rootless / Dopamine / Palera1n)
+   - `CircleSwitcher-2.2.9-Rootful-deb` (iOS 14 - 15 Rootful)

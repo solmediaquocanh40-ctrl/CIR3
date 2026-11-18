@@ -302,6 +302,7 @@ static UIColor *CSPreviewColorFromHex(NSString *hexStr, CGFloat alpha) {
     BOOL circleMorph       = prefs[@"circleMorph"]         ? [prefs[@"circleMorph"] boolValue]         : NO;
     CGFloat radius         = prefs[@"circleRadius"]        ? [prefs[@"circleRadius"] floatValue]       : 34.0f;
     CGFloat curvature      = prefs[@"wheelCurvature"]      ? [prefs[@"wheelCurvature"] floatValue]     : 1.05f;
+    CGFloat tilt           = prefs[@"tiltAmount"]          ? [prefs[@"tiltAmount"] floatValue]         : 1.0f;
     CGFloat cardScale      = prefs[@"cardScale"]           ? [prefs[@"cardScale"] floatValue]          : 0.86f;
     CGFloat orbSize        = prefs[@"orbSize"]             ? [prefs[@"orbSize"] floatValue]            : 0.72f;
     CGFloat spacing        = prefs[@"cardSpacing"]         ? [prefs[@"cardSpacing"] floatValue]        : 1.05f;
@@ -451,7 +452,7 @@ static UIColor *CSPreviewColorFromHex(NSString *hexStr, CGFloat alpha) {
             posX = (w * 0.5f) + cylR * sinT;
             posY = (h * 0.46f) - (1.0f - cosT) * 8.0f;
             transZ = (cosT - 1.0f) * 95.0f * curvature;
-            angleY = -theta * 0.78f * curvature;
+            angleY = -theta * 0.78f * curvature * tilt;
             depthScale = 0.62f + 0.38f * ((cosT + 1.0f) * 0.5f);
         } else if (mode == 2) {
             // Orbital Preview & Side Orbs
@@ -459,7 +460,7 @@ static UIColor *CSPreviewColorFromHex(NSString *hexStr, CGFloat alpha) {
             posX = (w * 0.5f) + cylR * sinT;
             posY = (h * 0.50f);
             transZ = (cosT - 1.0f) * 80.0f * curvature;
-            angleY = -sinT * 0.65f * curvature;
+            angleY = -sinT * 0.65f * curvature * tilt;
             depthScale = 0.68f + 0.32f * ((cosT + 1.0f) * 0.5f);
         } else if (mode == 3) {
             // Radial 360 Ring Wheel
