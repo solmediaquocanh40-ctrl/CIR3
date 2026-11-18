@@ -1,4 +1,4 @@
-name: Build CircleSwitcher 2.2.0 (.deb)
+name: Build CircleSwitcher 2.2.1 (.deb)
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     name: Build Rootless & Rootful .deb
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
@@ -43,13 +43,13 @@ jobs:
       - name: Upload Rootless .deb Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CircleSwitcher-2.2.0-Rootless-deb
+          name: CircleSwitcher-2.2.1-Rootless-deb
           path: dist/rootless/*.deb
           if-no-files-found: error
 
       - name: Upload Rootful .deb Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CircleSwitcher-2.2.0-Rootful-deb
+          name: CircleSwitcher-2.2.1-Rootful-deb
           path: dist/rootful/*.deb
           if-no-files-found: error
