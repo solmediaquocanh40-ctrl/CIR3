@@ -6,9 +6,9 @@
 #import <math.h>
 
 // ============================================================================
-// CircleSwitcher v2.2.0 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
+// CircleSwitcher v2.2.2 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
 // Supports iOS 14.0 - 16.3.1+ (Rootless & Rootful)
-// Critical Stability Fixes (v2.2.0):
+// Critical Stability Fixes (v2.2.2):
 //   - REMOVED drawViewHierarchyInRect: (eliminates GPU/WindowServer deadlock on iOS 16)
 //   - REMOVED viewDidLayoutSubviews mutation & recursive layoutSubviews loops
 //   - NEVER activates mid-swipe (only activates after transitionDidEnd into mode 2)
@@ -30,6 +30,7 @@
 @property (nonatomic, strong) SBAppSwitcherPageView *pageView;
 @property (nonatomic, assign) CGFloat contentPageViewScale;
 - (void)_cs_applyClassicTransform;
+- (void)_cs_updateClassicTitleLabel:(UIView *)pageView;
 - (void)_cs_resetToNativeFullscreen;
 - (UIView *)_cs_findHeaderView;
 - (void)_cs_restoreNativeHeader;
@@ -98,14 +99,17 @@ static UIImpactFeedbackGenerator *kHapticGenerator = nil;
 static const void *kCSCarouselStageKey = &kCSCarouselStageKey;
 static const void *kCSHeaderViewKey = &kCSHeaderViewKey;
 static const void *kCSHeaderOrigCenterKey = &kCSHeaderOrigCenterKey;
+static const void *kCSClassicTitleLabelKey = &kCSClassicTitleLabelKey;
 static CFTimeInterval kCSLastActivationTime = 0;
+static CFTimeInterval kCSLastTransitionBeginTime = 0;
 static BOOL CSUsesInfiniteCarouselOverlay(void); // forward declaration (defined below)
 
 // YES when the native per-card header must be forcibly hidden right now.
 static BOOL CSShouldHideNativeHeader(void) {
     if (!kEnabled || !gSwitcherSettledOpen) return NO;
-    if (CSUsesInfiniteCarouselOverlay()) return YES;      // overlay draws its own titles in every position
-    return (kTitlePosition == 3);                          // classic: only 'Hidden' hides it; 0/1/2 reposition it with the card
+    // Overlay draws its own titles; classic (2.2.2+) also draws its own per-card labels,
+    // so the native header is hidden in EVERY mode/position while the switcher is open.
+    return YES;
 }
 
 // ============================================================================
@@ -855,10 +859,21 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         }
         item.lastTheta = theta;
 
-        if (fabs(theta) > M_PI * 0.96) {
-            item.hidden = YES;
-            item.outerHaloView.hidden = YES;
-            continue;
+        // The old hard cut at |theta| > 0.96pi made the icon at the bottom of the radial
+        // ring (theta = +/-pi, directly above the x button) vanish outright, and made
+        // carousel icons pop instead of fading. Fade gradually instead, and never cull
+        // in radial-ring mode, where the bottom slot is a real position.
+        double absTheta = fabs(theta);
+        double edgeFade = 1.0;
+        if (kLayoutMode != 3) {
+            const double fadeStart = M_PI * 0.86;
+            const double fadeEnd = M_PI * 0.985;
+            if (absTheta >= fadeEnd) {
+                item.hidden = YES;
+                item.outerHaloView.hidden = YES;
+                continue;
+            }
+            if (absTheta > fadeStart) edgeFade = 1.0 - (absTheta - fadeStart) / (fadeEnd - fadeStart);
         }
         item.hidden = NO;
 
@@ -882,7 +897,9 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         } else if (kLayoutMode == 2) {
             double focus = MAX(0.0, cosT);
             double focusSmooth = pow(focus, 2.2);
-            CGFloat bigOrb = 224.0 * kCardScale;
+            // Cap the front orb by the angular spacing: with many apps the slots sit
+            // close together and a full-size front orb swallows its neighbours.
+            CGFloat bigOrb = MIN(224.0 * kCardScale, (CGFloat)((w * 0.44) * kCardSpacing * slotAngle * 1.55));
             CGFloat smallOrb = 112.0 * kOrbSize;
             CGFloat sz = smallOrb + (bigOrb - smallOrb) * focusSmooth;
             itemW = sz;
@@ -938,7 +955,12 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         item.layer.zPosition = cosT * 520.0;
         CGFloat killAlpha = (killYOffset < -10.0) ? MAX(0.15, 1.0 + (killYOffset / 240.0)) : 1.0;
         CGFloat fadeAlpha = kFadeIcons ? MAX(0.32, 0.38 + 0.62 * frontWeight) : 0.94;
-        item.alpha = fadeAlpha * killAlpha;
+        item.alpha = fadeAlpha * killAlpha * (CGFloat)edgeFade;
+
+        // Frosting for overlaps: the front item turns nearly opaque (its frosted glass
+        // view blurs whatever sits behind it), so a neighbouring orb no longer ghosts
+        // through it where the two overlap.
+        item.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.19 alpha:(0.86 + 0.12 * (CGFloat)frontWeight)];
 
         // Border and glass rim share the item's own layer path & corner radius, and the rim
         // image is refitted to the item's exact bounds on every layout - one frame, one shape.
@@ -946,7 +968,11 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         if (kLiquidGlass && kGlowIntensity > 0.01) {
             item.layer.borderWidth = 2.0;
             item.layer.borderColor = CSDispersedGlowColor(MIN(0.95, 0.45 + kGlowIntensity * 0.50)).CGColor;
-            item.glassRimOverlay.alpha = MIN(0.92, (0.18 + kGlowIntensity * 0.40) * (0.45 + kGlassSpecular * 0.65) * (0.55 + kGlassRefract * 0.55));
+            // The rim PNG's stroke is inset from its canvas edges, so on cards it drew a
+            // second, inner frame that never matched the layer border ('glass mask does
+            // not hug the border'). Cards use the single layer border only; round orbs
+            // keep the rim sheen.
+            item.glassRimOverlay.alpha = isCircular ? MIN(0.92, (0.18 + kGlowIntensity * 0.40) * (0.45 + kGlassSpecular * 0.65) * (0.55 + kGlassRefract * 0.55)) : 0.0;
         } else {
             item.layer.borderWidth = 0.0;
             item.glassRimOverlay.alpha = 0.0;
@@ -1077,6 +1103,12 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 
     if (pan.state == UIGestureRecognizerStateBegan) {
         [self stopPhysics];
+        // Rasterize items for the duration of the drag: per-frame shadow/blur redraws on
+        // the CPU were a major source of carousel stutter.
+        for (CSInfiniteCarouselItem *item in self.items) {
+            item.layer.shouldRasterize = YES;
+            item.layer.rasterizationScale = [UIScreen mainScreen].scale;
+        }
         self.panLockedHorizontal = NO;
         self.panLockedVertical = NO;
         self.verticalDragOffset = 0.0;
@@ -1106,6 +1138,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
             [self layoutCarousel3D];
         }
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        for (CSInfiniteCarouselItem *item in self.items) item.layer.shouldRasterize = NO;
         if (self.panLockedVertical) {
             if (self.verticalDragOffset < -95.0 || velocity.y < -650.0) {
                 [self handleKillFrontApp:nil];
@@ -1194,6 +1227,17 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         [UIView animateWithDuration:0.24 animations:^{
             [self layoutCarousel3D];
         }];
+        // Contract: glide the survivors into their new, tighter slots and bring the next
+        // app to the front. Without this they stayed parked at the old angles - the photo
+        // with two icons stranded at opposite screen edges and the front slot empty.
+        if (kLayoutMode != 3 && self.items.count > 1) {
+            double step = [self slotAngleForCount:(NSInteger)self.items.count];
+            if (step > 0.0001) {
+                self.snapTargetAngle = round(self.spinAngle / step) * step;
+                self.isSnapping = YES;
+                [self startPhysicsIfNeeded];
+            }
+        }
     }];
 }
 
@@ -1288,8 +1332,10 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     %orig;
 
     if (!kEnabled || CSUsesInfiniteCarouselOverlay() || !gSwitcherSettledOpen) {
-        if (self.layer.cornerRadius != 0.0 || self.layer.borderWidth != 0.0) {
-            self.layer.cornerRadius = 0.0;
+        if (self.layer.borderWidth != 0.0 || self.layer.shadowOpacity != 0.0) {
+            // Do NOT touch cornerRadius: it is the system's own card rounding. Zeroing it
+            // made our border square while the snapshot stayed rounded - the black inner
+            // frame in the user's photos.
             self.layer.masksToBounds = NO;
             self.layer.borderWidth = 0.0;
             self.layer.shadowOpacity = 0.0;
@@ -1316,7 +1362,6 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     }
 
     if (!inSwitcherCard) {
-        self.layer.cornerRadius = 0.0;
         self.layer.masksToBounds = NO;
         self.layer.borderWidth = 0.0;
         self.layer.shadowOpacity = 0.0;
@@ -1332,8 +1377,10 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             self.layer.cornerCurve = kCACornerCurveContinuous;
         }
     } else {
-        self.layer.cornerRadius = 0.0;
-        self.layer.masksToBounds = NO;
+        // Keep the system's own card corner radius; clip + border live on THIS layer
+        // only, so border, glass and mask share exactly one shape.
+        if (self.layer.cornerRadius < 1.0) self.layer.cornerRadius = 28.0;
+        self.layer.masksToBounds = YES;
     }
 
     if (kLiquidGlass && kGlowIntensity > 0.01) {
@@ -1347,8 +1394,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 - (void)_updateCornerRadius {
     %orig;
     if (!kEnabled || CSUsesInfiniteCarouselOverlay() || !gSwitcherSettledOpen) {
-        if (self.layer.cornerRadius != 0.0 || self.layer.borderWidth != 0.0) {
-            self.layer.cornerRadius = 0.0;
+        if (self.layer.borderWidth != 0.0) {
             self.layer.masksToBounds = NO;
             self.layer.borderWidth = 0.0;
             self.layer.mask = nil;
@@ -1386,8 +1432,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         if (!CATransform3DIsIdentity(targetView.layer.transform)) {
             targetView.layer.transform = CATransform3DIdentity;
         }
-        if (targetView.layer.cornerRadius != 0.0 || targetView.layer.borderWidth != 0.0) {
-            targetView.layer.cornerRadius = 0.0;
+        if (targetView.layer.borderWidth != 0.0 || targetView.layer.shadowOpacity != 0.0) {
             targetView.layer.masksToBounds = NO;
             targetView.layer.borderWidth = 0.0;
             targetView.layer.shadowOpacity = 0.0;
@@ -1396,6 +1441,9 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     }
     if (self.layer.zPosition != 0.0) self.layer.zPosition = 0.0;
     if (self.layer.shadowOpacity != 0.0) self.layer.shadowOpacity = 0.0;
+    self.layer.shadowPath = nil;
+    UILabel *csTitleLabel = objc_getAssociatedObject(self, kCSClassicTitleLabelKey);
+    if (csTitleLabel) csTitleLabel.hidden = YES;
     UIView *resetTarget = ([self respondsToSelector:@selector(pageView)] && self.pageView) ? self.pageView : self.subviews.firstObject;
     if (resetTarget && resetTarget.alpha != 1.0) resetTarget.alpha = 1.0;
     [self _cs_restoreNativeHeader];
@@ -1488,7 +1536,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             angleZ = clampedT * (M_PI / 18.0) * kWheelCurvature;
             transY = (absT * absT) * 44.0 * kWheelCurvature;
             transZ = -absT * 95.0 * kWheelCurvature;
-            scale  = kCardScale * MAX(0.72, 1.0 - absT * 0.14);
+            scale  = kCardScale * MAX(0.78, 1.0 - absT * 0.10);
             break;
         }
         case 5: {
@@ -1509,7 +1557,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             CGFloat flowFactor = MIN(1.0, absT * 1.4);
             angleY = -sign * flowFactor * (M_PI / 3.4) * kWheelCurvature;
             transZ = -flowFactor * 120.0 * kWheelCurvature;
-            scale  = kCardScale * (1.0 - flowFactor * 0.14);
+            scale  = kCardScale * (1.0 - flowFactor * 0.10);
             break;
         }
         case 8: {
@@ -1517,7 +1565,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             CGFloat flowFactor = MIN(1.0, absT * 1.4);
             angleY = sign * flowFactor * (M_PI / 3.4) * kWheelCurvature;
             transZ = -flowFactor * 120.0 * kWheelCurvature;
-            scale  = kCardScale * (1.0 - flowFactor * 0.14);
+            scale  = kCardScale * (1.0 - flowFactor * 0.10);
             break;
         }
         case 9:
@@ -1540,39 +1588,96 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     transform = CATransform3DScale(transform, scale, scale, 1.0);
     targetView.layer.transform = transform;
     targetView.alpha = kFadeIcons ? MAX(0.50, 1.0 - absT * 0.35) : 1.0;
+    if (kTitlePosition == 1) targetView.alpha *= 0.78; // 'center (dim card)' behind our own title label
 
-    // The native header is a sibling of the page view, so the old code left it floating at
-    // its scroll position while the card moved - the top row showed another app's name.
-    // Reposition it with the card and give it the same transform.
+    // 2.2.2: repositioning the native header never survived the system's own layout
+    // pass on device (headers stayed piled at the top in every classic mode, in the
+    // user's 149s test video). The native header is now always hidden in classic too,
+    // and CircleSwitcher draws its OWN title label inside the page view - it inherits
+    // the card's transform exactly, so all 4 title positions work for real.
     UIView *header = [self _cs_findHeaderView];
     if (header) {
-        if (kTitlePosition == 3) {
-            header.hidden = YES;
-            header.layer.opacity = 0.0;
-        } else {
-            header.hidden = NO;
-            header.layer.opacity = 1.0;
-            if (header.superview == self) {
-                NSValue *origVal = objc_getAssociatedObject(self, kCSHeaderOrigCenterKey);
-                CGPoint hc = origVal ? [origVal CGPointValue] : header.center;
-                if (kTitlePosition == 1) {
-                    hc = CGPointMake(targetView.center.x, targetView.center.y);
-                } else if (kTitlePosition == 2) {
-                    hc = CGPointMake(targetView.center.x, CGRectGetMaxY(targetView.frame) - 26.0);
-                }
-                header.center = hc;
-            }
-            header.layer.transform = transform;
-        }
+        header.hidden = YES;
+        header.layer.opacity = 0.0;
     }
+    [self _cs_updateClassicTitleLabel:targetView];
 
     if (kLiquidGlass && kGlowIntensity > 0.01) {
+        // Glow hugs the card itself: the shadow path is the page view's rounded rect.
+        // A plain container shadow used the container's bigger, offset frame and drew
+        // the extra ghost frame around classic cards.
+        CGFloat cardRadius = targetView.layer.cornerRadius;
+        if (cardRadius < 1.0) cardRadius = 28.0;
         self.layer.shadowColor = CSActiveGlowColor(1.0).CGColor;
         self.layer.shadowOpacity = (float)(kGlowIntensity * MAX(0.25, 1.0 - absT * 0.45));
         self.layer.shadowRadius = 18.0;
         self.layer.shadowOffset = CGSizeMake(0, 6);
+        self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:targetView.frame cornerRadius:cardRadius].CGPath;
     } else {
         self.layer.shadowOpacity = 0.0;
+        self.layer.shadowPath = nil;
+    }
+}
+
+%new
+- (void)_cs_updateClassicTitleLabel:(UIView *)pageView {
+    if (!pageView) return;
+    UILabel *label = objc_getAssociatedObject(self, kCSClassicTitleLabelKey);
+    if (!label) {
+        label = [[UILabel alloc] initWithFrame:CGRectZero];
+        label.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+        label.textColor = [UIColor whiteColor];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.numberOfLines = 1;
+        label.adjustsFontSizeToFitWidth = YES;
+        label.minimumScaleFactor = 0.7;
+        label.layer.shadowColor = [UIColor blackColor].CGColor;
+        label.layer.shadowOpacity = 0.85;
+        label.layer.shadowRadius = 3.0;
+        label.layer.shadowOffset = CGSizeMake(0, 1.0);
+        label.userInteractionEnabled = NO;
+        objc_setAssociatedObject(self, kCSClassicTitleLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (label.superview != pageView) {
+        [label removeFromSuperview];
+        [pageView addSubview:label];
+    }
+    [pageView bringSubviewToFront:label];
+
+    if (kTitlePosition == 3) { label.hidden = YES; return; }
+
+    NSString *name = nil;
+    @try {
+        id layout = [self respondsToSelector:@selector(appLayout)] ? [self valueForKey:@"appLayout"] : nil;
+        NSArray *allItems = [layout respondsToSelector:@selector(allItems)] ? [layout valueForKey:@"allItems"] : nil;
+        id firstItem = [allItems isKindOfClass:[NSArray class]] ? allItems.firstObject : nil;
+        NSString *bid = [firstItem respondsToSelector:@selector(bundleIdentifier)] ? [firstItem valueForKey:@"bundleIdentifier"] : nil;
+        if (bid.length) {
+            Class acCls = NSClassFromString(@"SBApplicationController");
+            if (acCls && [acCls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) {
+                id ac = ((id (*)(id, SEL))objc_msgSend)(acCls, NSSelectorFromString(@"sharedInstance"));
+                SEL appSel = NSSelectorFromString(@"applicationWithBundleIdentifier:");
+                if (ac && [ac respondsToSelector:appSel]) {
+                    id app = ((id (*)(id, SEL, id))objc_msgSend)(ac, appSel, bid);
+                    if ([app respondsToSelector:@selector(displayName)]) name = [app valueForKey:@"displayName"];
+                }
+            }
+            if (!name.length) name = [[bid componentsSeparatedByString:@"."] lastObject];
+        }
+    } @catch (NSException *e) {}
+    if (!name.length) { label.hidden = YES; return; }
+    if (![label.text isEqualToString:name]) label.text = name;
+    label.hidden = NO;
+
+    CGFloat pw = pageView.bounds.size.width;
+    CGFloat ph = pageView.bounds.size.height;
+    label.bounds = CGRectMake(0, 0, pw * 0.88, 22.0);
+    if (kTitlePosition == 1) {
+        label.center = CGPointMake(pw * 0.5, ph * 0.5);
+    } else if (kTitlePosition == 2) {
+        label.center = CGPointMake(pw * 0.5, ph - 20.0);
+    } else {
+        label.center = CGPointMake(pw * 0.5, 20.0);
     }
 }
 
@@ -1600,6 +1705,17 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         id toModeObj = [context valueForKeyPath:@"toLayoutState.unlockedEnvironmentMode"];
         if (toModeObj && [toModeObj respondsToSelector:@selector(integerValue)]) {
             NSInteger toMode = [toModeObj integerValue];
+            if (toMode == 2) {
+                // Attach the overlay at the START of the open transition, not the end:
+                // the stage rides the system's own presentation animation, so the first
+                // visible frame is already CircleSwitcher - no default-switcher flash and
+                // no 'overlay pops in after a delay'.
+                kCSLastTransitionBeginTime = CACurrentMediaTime();
+                gSwitcherSettledOpen = YES;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self _cs_setSwitcherActive:YES];
+                });
+            }
             // Immediately hide overlay as soon as user leaves App Switcher (to Home=1 or App=3)
             if (toMode != 2) {
                 gSwitcherSettledOpen = NO;
@@ -1645,7 +1761,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 
     // Both the view-controller hook and the coordinator hook used to activate the stage for
     // the same transition, rebuilding the whole carousel twice per open. Debounce repeats.
-    if (active && stage && !stage.hidden && (CACurrentMediaTime() - kCSLastActivationTime) < 0.40) {
+    if (active && stage && !stage.hidden && (CACurrentMediaTime() - kCSLastActivationTime) < 1.0) {
         gIsUpdatingSwitcherState = NO;
         return;
     }
@@ -1671,7 +1787,10 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             stage.alpha = 1.0;
             kCSLastActivationTime = CACurrentMediaTime();
             stage.userInteractionEnabled = YES;
-            if (wasHidden) {
+            if (wasHidden && (CACurrentMediaTime() - kCSLastTransitionBeginTime) > 0.45) {
+                // Only run our own entrance when the stage was attached late (prefs change
+                // or fallback path). On an early attach the system's presentation
+                // animation already provides the motion - a second one reads as delay.
                 [stage triggerSafeEntranceMotionBlur];
             }
         } else {
@@ -1707,28 +1826,55 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 %new
 - (void)_cs_dismissSwitcherToHome {
     gSwitcherSettledOpen = NO;
-    [self _cs_setSwitcherActive:NO];
+
+    // 2.2.2: send the 'go home' command FIRST and tear the overlay down afterwards.
+    // The old order restored the native switcher first, so whenever the home command
+    // was slow (or a selector missed on this iOS) the user landed on the DEFAULT
+    // switcher instead of the home screen after tapping empty space.
+    CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
+    if (stage) {
+        [stage stopPhysics];
+        stage.userInteractionEnabled = NO;
+    }
+
+    BOOL sentHome = NO;
     @try {
         Class sbUI = NSClassFromString(@"SBUIController");
         if (sbUI && [sbUI respondsToSelector:NSSelectorFromString(@"sharedInstance")]) {
             id ui = ((id (*)(id, SEL))objc_msgSend)(sbUI, NSSelectorFromString(@"sharedInstance"));
-            SEL homeSel = NSSelectorFromString(@"handleHomeButtonSinglePressUp");
-            if (ui && [ui respondsToSelector:homeSel]) {
-                ((void (*)(id, SEL))objc_msgSend)(ui, homeSel);
-                return;
+            for (NSString *selName in @[@"clickedMenuButton", @"handleHomeButtonSinglePressUp"]) {
+                SEL homeSel = NSSelectorFromString(selName);
+                if (ui && [ui respondsToSelector:homeSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(ui, homeSel);
+                    sentHome = YES;
+                    break;
+                }
             }
         }
-        for (NSString *clsName in @[@"SBMainSwitcherControllerCoordinator", @"SBMainSwitcherViewController"]) {
-            Class cls = NSClassFromString(clsName);
-            if (!cls || ![cls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) continue;
-            id inst = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
-            SEL toggleSel = NSSelectorFromString(@"toggleMainSwitcherNoninteractivelyWithSource:");
-            if (inst && [inst respondsToSelector:toggleSel]) {
-                ((void (*)(id, SEL, NSInteger))objc_msgSend)(inst, toggleSel, 0);
-                return;
+        if (!sentHome) {
+            for (NSString *clsName in @[@"SBMainSwitcherControllerCoordinator", @"SBMainSwitcherViewController"]) {
+                Class cls = NSClassFromString(clsName);
+                if (!cls || ![cls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) continue;
+                id inst = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
+                SEL toggleSel = NSSelectorFromString(@"toggleMainSwitcherNoninteractivelyWithSource:");
+                if (inst && [inst respondsToSelector:toggleSel]) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(inst, toggleSel, 0);
+                    sentHome = YES;
+                    break;
+                }
             }
         }
     } @catch (NSException *e) {}
+
+    if (sentHome) {
+        // The system dismissal runs with the overlay still covering the native
+        // switcher; tear down shortly after so no native frame is ever revealed.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self _cs_setSwitcherActive:NO];
+        });
+    } else {
+        [self _cs_setSwitcherActive:NO];
+    }
 }
 
 %new
