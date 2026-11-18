@@ -4,11 +4,17 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
+#import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <CoreVideo/CoreVideo.h>
+#import <simd/simd.h>
+#import "CSGlassShader.h"
 
 // ============================================================================
-// CircleSwitcher v2.2.6 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
+// CircleSwitcher v2.2.7 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
 // Supports iOS 14.0 - 16.3.1+ (Rootless & Rootful)
-// Critical Stability Fixes (v2.2.6):
+// Critical Stability Fixes (v2.2.7):
 //   - REMOVED drawViewHierarchyInRect: (eliminates GPU/WindowServer deadlock on iOS 16)
 //   - REMOVED viewDidLayoutSubviews mutation & recursive layoutSubviews loops
 //   - NEVER activates mid-swipe (only activates after transitionDidEnd into mode 2)
@@ -371,6 +377,335 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 }
 
 // ============================================================================
+// Liquid Glass Engine (2.2.7) — real refraction glass for overlay modes 0-3.
+// Adapted from LiquidGlassKit (Alexey Demin) as supplied by the user: the SDF
+// fragment shader (CSGlassShader.h — compiled ON-DEVICE at runtime because
+// the Ubuntu CI build has no Apple Metal toolchain), the CABackdropLayer
+// capture trick and the IOSurface zero-copy bridge, re-implemented in ObjC
+// with one crucial change: the backdrop is captured ONCE per switcher open
+// (the scene behind the stage is static while swiping), never per frame, and
+// no per-frame path ever waits on the GPU. Any failure at any step leaves the
+// tweak on its previous frosted-glass look — the engine can never take the
+// switcher down with it.
+// ============================================================================
+
+// Uniform block shared with the shader. Field order and types MUST mirror
+// ShaderUniforms in CSGlassShader.h / LiquidGlassCS.metal exactly.
+typedef struct {
+    vector_float2 resolution;
+    float contentsScale;
+    vector_float2 touchPoint;
+    float shapeMergeSmoothness;
+    float cornerRadius;
+    float cornerRoundnessExponent;
+    vector_float4 materialTint;
+    float glassThickness;
+    float refractiveIndex;
+    float dispersionStrength;
+    float fresnelDistanceRange;
+    float fresnelIntensity;
+    float fresnelEdgeSharpness;
+    float glareDistanceRange;
+    float glareAngleConvergence;
+    float glareOppositeSideBias;
+    float glareIntensity;
+    float glareEdgeSharpness;
+    float glareDirectionOffset;
+    int32_t rectangleCount;
+    vector_float4 rectangles[16];
+    float rectRadii[16];
+} CSGlassUniforms;
+
+@interface CSGlassEngine : NSObject
+@property (nonatomic, strong, readonly) id<MTLDevice> device;
+@property (nonatomic, strong, readonly) id<MTLCommandQueue> commandQueue;
+@property (nonatomic, strong, readonly) id<MTLRenderPipelineState> pipelineState;
++ (instancetype)shared;
+- (BOOL)prepare; // compiles the embedded shader; NO (and stays NO) on any failure
+@end
+
+@implementation CSGlassEngine {
+    BOOL _prepareAttempted;
+    BOOL _ready;
+}
+
++ (instancetype)shared {
+    static CSGlassEngine *engine = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ engine = [[CSGlassEngine alloc] init]; });
+    return engine;
+}
+
+- (BOOL)prepare {
+    @synchronized (self) {
+        if (_prepareAttempted) return _ready;
+        _prepareAttempted = YES;
+        @try {
+            _device = MTLCreateSystemDefaultDevice();
+            if (!_device) return NO;
+            _commandQueue = [_device newCommandQueue];
+            if (!_commandQueue) return NO;
+            NSError *error = nil;
+            id<MTLLibrary> library = [_device newLibraryWithSource:kCSGlassShaderSource options:nil error:&error];
+            if (!library) return NO;
+            id<MTLFunction> vertexFn = [library newFunctionWithName:@"fullscreenQuad"];
+            id<MTLFunction> fragmentFn = [library newFunctionWithName:@"liquidGlassEffect"];
+            if (!vertexFn || !fragmentFn) return NO;
+            MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+            desc.vertexFunction = vertexFn;
+            desc.fragmentFunction = fragmentFn;
+            desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            _pipelineState = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (!_pipelineState) return NO;
+            _ready = YES;
+        } @catch (NSException *exception) {
+            _ready = NO;
+        }
+        return _ready;
+    }
+}
+
+@end
+
+// A view whose layer is the system's own CABackdropLayer: WindowServer fills
+// it with everything rendered behind it in the window. Drawing this view into
+// a bitmap snapshots that backdrop — the same capture SpringBoard's own blur
+// materials are built on.
+@interface CSBackdropView : UIView
+@end
+
+@implementation CSBackdropView
+
++ (Class)layerClass {
+    Class cls = NSClassFromString(@"CABackdropLayer");
+    return cls ? cls : [CALayer class];
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.userInteractionEnabled = NO;
+        [self.layer setValue:@NO forKey:@"layerUsesCoreImageFilters"];
+        [self.layer setValue:@YES forKey:@"windowServerAware"];
+        [self.layer setValue:[[NSUUID UUID] UUIDString] forKey:@"groupName"];
+    }
+    return self;
+}
+
+@end
+
+// Zero-copy bridge: renders the backdrop view into an IOSurface-backed
+// CVPixelBuffer and exposes it as an MTLTexture, then applies a single MPS
+// blur pass (once per capture — the frosted base the refraction bends).
+@interface CSGlassBridge : NSObject
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (id<MTLTexture>)renderBackdropView:(UIView *)backdropView captureScale:(CGFloat)captureScale blurSigma:(float)blurSigma;
+@end
+
+@implementation CSGlassBridge {
+    id<MTLDevice> _device;
+    CVMetalTextureCacheRef _textureCache;
+    CVPixelBufferRef _pixelBuffer;
+    CVMetalTextureRef _cvTexture;
+    CGSize _bufferSize;
+}
+
+- (instancetype)initWithDevice:(id<MTLDevice>)device {
+    self = [super init];
+    if (self) {
+        _device = device;
+        _bufferSize = CGSizeZero;
+        if (device) CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, device, NULL, &_textureCache);
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_cvTexture) CFRelease(_cvTexture);
+    if (_pixelBuffer) CFRelease(_pixelBuffer);
+    if (_textureCache) CFRelease(_textureCache);
+}
+
+- (BOOL)setupBufferWithWidth:(NSInteger)width height:(NSInteger)height {
+    if (width < 2 || height < 2 || !_textureCache) return NO;
+    if (_pixelBuffer && _cvTexture && (NSInteger)_bufferSize.width == width && (NSInteger)_bufferSize.height == height) return YES;
+    if (_cvTexture) { CFRelease(_cvTexture); _cvTexture = NULL; }
+    if (_pixelBuffer) { CFRelease(_pixelBuffer); _pixelBuffer = NULL; }
+    NSDictionary *attrs = @{
+        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
+        (__bridge NSString *)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &_pixelBuffer) != kCVReturnSuccess) return NO;
+    if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache, _pixelBuffer, NULL, MTLPixelFormatBGRA8Unorm, (size_t)width, (size_t)height, 0, &_cvTexture) != kCVReturnSuccess) return NO;
+    _bufferSize = CGSizeMake(width, height);
+    return YES;
+}
+
+- (id<MTLTexture>)renderBackdropView:(UIView *)backdropView captureScale:(CGFloat)captureScale blurSigma:(float)blurSigma {
+    if (!backdropView || backdropView.bounds.size.width < 2.0 || backdropView.bounds.size.height < 2.0) return nil;
+    NSInteger width = (NSInteger)lrint(backdropView.bounds.size.width * captureScale);
+    NSInteger height = (NSInteger)lrint(backdropView.bounds.size.height * captureScale);
+    if (![self setupBufferWithWidth:width height:height]) return nil;
+
+    CVPixelBufferLockBaseAddress(_pixelBuffer, 0);
+    void *base = CVPixelBufferGetBaseAddress(_pixelBuffer);
+    CGContextRef context = NULL;
+    if (base) {
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        context = CGBitmapContextCreate(base, (size_t)width, (size_t)height, 8, CVPixelBufferGetBytesPerRow(_pixelBuffer), space, (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(space);
+    }
+    if (!context) {
+        CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
+        return nil;
+    }
+    CGContextScaleCTM(context, captureScale, captureScale);
+    UIGraphicsPushContext(context);
+    [backdropView drawViewHierarchyInRect:backdropView.bounds afterScreenUpdates:NO];
+    UIGraphicsPopContext();
+    CGContextRelease(context);
+    CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
+    CVMetalTextureCacheFlush(_textureCache, 0);
+
+    id<MTLTexture> texture = CVMetalTextureGetTexture(_cvTexture);
+    if (!texture) return nil;
+
+    if (blurSigma > 0.01f) {
+        id<MTLCommandBuffer> commandBuffer = [[CSGlassEngine shared].commandQueue commandBuffer];
+        if (commandBuffer) {
+            MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:_device sigma:blurSigma];
+            blur.edgeMode = MPSImageEdgeModeClamp;
+            id<MTLTexture> working = texture;
+            [blur encodeToCommandBuffer:commandBuffer inPlaceTexture:&working fallbackCopyAllocator:nil];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted]; // once per open only — never per frame
+            texture = working;
+        }
+    }
+    return texture;
+}
+
+@end
+
+// The single Metal view that draws every glass shape on the stage in one
+// pass. Paused + setNeedsDisplay-driven: it renders only when a shape,
+// the backdrop or an override actually changed.
+@interface CSGlassView : MTKView
+@property (nonatomic, strong) id<MTLTexture> backgroundTexture;
+@property (nonatomic, assign) NSInteger overrideIndex; // shape slot replaced by overrideRect (-1 = none)
+@property (nonatomic, assign) CGRect overrideRect;
+@property (nonatomic, assign) CGFloat overrideRadius;
+- (void)updateShapesWithRects:(NSArray<NSValue *> *)rects radii:(NSArray<NSNumber *> *)radii;
+- (id<MTLTexture>)captureBackdropView:(UIView *)backdropView;
+@end
+
+@implementation CSGlassView {
+    CSGlassBridge *_bridge;
+    id<MTLBuffer> _uniformsBuffer;
+    NSArray<NSValue *> *_shapeRects;
+    NSArray<NSNumber *> *_shapeRadii;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    CSGlassEngine *engine = [CSGlassEngine shared];
+    self = [super initWithFrame:frame device:engine.device];
+    if (self) {
+        self.userInteractionEnabled = NO;
+        self.opaque = NO;
+        self.layer.opaque = NO;
+        self.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        self.paused = YES;
+        self.enableSetNeedsDisplay = YES;
+        self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+        _overrideIndex = -1;
+        _shapeRects = @[];
+        _shapeRadii = @[];
+        _bridge = [[CSGlassBridge alloc] initWithDevice:engine.device];
+        _uniformsBuffer = [engine.device newBufferWithLength:sizeof(CSGlassUniforms) options:MTLResourceStorageModeShared];
+    }
+    return self;
+}
+
+- (void)setOverrideIndex:(NSInteger)index { _overrideIndex = index; [self setNeedsDisplay]; }
+- (void)setOverrideRect:(CGRect)rect { _overrideRect = rect; [self setNeedsDisplay]; }
+- (void)setOverrideRadius:(CGFloat)radius { _overrideRadius = radius; [self setNeedsDisplay]; }
+
+- (void)updateShapesWithRects:(NSArray<NSValue *> *)rects radii:(NSArray<NSNumber *> *)radii {
+    _shapeRects = [rects copy] ?: @[];
+    _shapeRadii = [radii copy] ?: @[];
+    [self setNeedsDisplay];
+}
+
+- (id<MTLTexture>)captureBackdropView:(UIView *)backdropView {
+    if (!backdropView) return nil;
+    // Half-resolution capture: a soft, frosted base for the refraction, at a
+    // fraction of the memory and GPU cost of a full-resolution snapshot.
+    CGFloat captureScale = MAX(0.1, self.layer.contentsScale * 0.5);
+    return [_bridge renderBackdropView:backdropView captureScale:captureScale blurSigma:5.0f];
+}
+
+- (void)drawRect:(CGRect)rect {
+    CSGlassEngine *engine = [CSGlassEngine shared];
+    if (!engine.pipelineState || !self.backgroundTexture || !_uniformsBuffer) return;
+    id<MTLDrawable> drawable = self.currentDrawable;
+    MTLRenderPassDescriptor *pass = self.currentRenderPassDescriptor;
+    if (!drawable || !pass) return;
+
+    CSGlassUniforms *u = (CSGlassUniforms *)_uniformsBuffer.contents;
+    memset(u, 0, sizeof(*u));
+    CGFloat scale = self.layer.contentsScale;
+    u->resolution = simd_make_float2((float)(self.bounds.size.width * scale), (float)(self.bounds.size.height * scale));
+    u->contentsScale = (float)scale;
+    u->touchPoint = simd_make_float2(0.0f, 0.0f);
+    u->shapeMergeSmoothness = 0.2f;
+    u->cornerRadius = 24.0f;
+    u->cornerRoundnessExponent = 2.0f;
+    // Subtle deep-blue material tint; the three Settings glass sliders drive
+    // the optical parameters (refraction / specular / dispersion) for real.
+    u->materialTint = simd_make_float4(0.10f, 0.16f, 0.26f, 0.45f);
+    u->glassThickness = (float)(6.0 + kGlassRefract * 8.0);
+    u->refractiveIndex = (float)(1.0 + kGlassRefract * 0.75);
+    u->dispersionStrength = (float)(kGlassDispersion * 14.0);
+    u->fresnelDistanceRange = 70.0f;
+    u->fresnelIntensity = (float)(kGlassSpecular * 0.35);
+    u->fresnelEdgeSharpness = 0.0f;
+    u->glareDistanceRange = 30.0f;
+    u->glareAngleConvergence = 0.1f;
+    u->glareOppositeSideBias = 1.0f;
+    u->glareIntensity = (float)(0.05 + kGlassSpecular * 0.25);
+    u->glareEdgeSharpness = -0.15f;
+    u->glareDirectionOffset = (float)(-M_PI / 4.0);
+
+    NSInteger count = MIN((NSInteger)_shapeRects.count, 16);
+    u->rectangleCount = (int32_t)count;
+    for (NSInteger i = 0; i < count; i++) {
+        CGRect r = [_shapeRects[i] CGRectValue];
+        CGFloat radius = (i < (NSInteger)_shapeRadii.count) ? _shapeRadii[i].doubleValue : 0.0;
+        if (i == _overrideIndex) {
+            r = _overrideRect;
+            radius = _overrideRadius;
+        }
+        u->rectangles[i] = simd_make_float4((float)r.origin.x, (float)r.origin.y, (float)r.size.width, (float)r.size.height);
+        u->rectRadii[i] = (float)radius;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [engine.commandQueue commandBuffer];
+    if (!commandBuffer) return;
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) return;
+    [encoder setRenderPipelineState:engine.pipelineState];
+    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:0];
+    [encoder setFragmentTexture:self.backgroundTexture atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [encoder endEncoding];
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+}
+
+@end
+
+// ============================================================================
 // Frosted Liquid Glass Carousel Item View (Zero Squashing, 60fps Lightweight)
 // ============================================================================
 
@@ -501,6 +836,21 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 @property (nonatomic, assign) CGFloat verticalDragOffset;
 @property (nonatomic, assign) BOOL isLayingOutCarousel;
 @property (nonatomic, assign) CGSize lastLayoutSize;
+// --- 2.2.7 real-glass stage state ---
+@property (nonatomic, strong) CSGlassView *glassView;
+@property (nonatomic, strong) CSBackdropView *backdropView;
+@property (nonatomic, assign) BOOL glassActive;
+@property (nonatomic, assign) NSInteger glassFrontShapeIndex; // front item's slot in the glass shape list (-1 = none)
+@property (nonatomic, assign) CFTimeInterval glassCaptureToken;
+@property (nonatomic, strong) UIColor *savedPillColor;
+@property (nonatomic, strong) UIColor *savedCloseColor;
+@property (nonatomic, assign) BOOL dismissPending; // exit requested: taps ignored, carousel stays alive
+@property (nonatomic, assign) BOOL morphUsesGlass;
+@property (nonatomic, strong) CADisplayLink *expandDisplayLink;
+@property (nonatomic, assign) CFTimeInterval expandStartTime;
+@property (nonatomic, assign) BOOL expandActive;
+@property (nonatomic, assign) CGRect expandFromRect;
+@property (nonatomic, assign) CGFloat expandFromRadius;
 - (NSInteger)reloadAppsFromSwitcher;
 - (CSInfiniteCarouselItem *)_cs_makeItemForLayout:(id)layout bundleID:(NSString *)bid halo:(UIImage *)haloImg rim:(UIImage *)rimImg stretchedRim:(UIImage *)stretchedRim;
 - (void)layoutCarousel3D;
@@ -509,6 +859,10 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 - (void)finishEntranceMorph;
 - (void)stopPhysics;
 - (void)startPhysicsIfNeeded;
+- (BOOL)_cs_prepareGlass;
+- (void)_cs_setGlassActive:(BOOL)active;
+- (void)_cs_beginAppExpand;
+- (void)_cs_stopAppExpand;
 @end
 
 @implementation CSInfiniteCarouselStageView
@@ -650,6 +1004,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     }
     self.angularVelocity = 0.0;
     self.isSnapping = NO;
+    [self _cs_stopAppExpand];
     [self finishEntranceMorph];
 }
 
@@ -695,6 +1050,28 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         [self layoutCarousel3D];
         if (self.items.count == 0 || self.frontRestSize.width < 10.0) return;
     }
+    if (self.glassActive && self.glassFrontShapeIndex >= 0) {
+        // 2.2.7 glass morph: the front item's glass shape itself starts as a big
+        // rounded "screen" and pulls its corners in while shrinking into its
+        // slot. No view is resized per frame — only shader uniforms change — so
+        // the per-frame blur re-renders that made the old morph jerk are gone.
+        // The motion blur rides the fixed-size stage veil (alpha only).
+        CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+        self.morphUsesGlass = YES;
+        self.morphActive = YES;
+        self.morphStartTime = CACurrentMediaTime();
+        self.glassView.overrideIndex = self.glassFrontShapeIndex;
+        self.glassView.overrideRect = CGRectMake(w * 0.06, h * 0.07, w * 0.88, h * 0.82);
+        self.glassView.overrideRadius = 46.0;
+        self.carouselContentLayer.alpha = 0.0;
+        self.topHeaderPill.hidden = YES;
+        self.entranceBlurVeil.hidden = NO;
+        self.entranceBlurVeil.alpha = 0.0;
+        self.morphDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(morphTick:)];
+        [self.morphDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        return;
+    }
+
     NSInteger idx = self.frontItemIndex;
     if (idx < 0 || idx >= (NSInteger)self.items.count) idx = 0;
     CSInfiniteCarouselItem *front = self.items[idx];
@@ -748,6 +1125,28 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 }
 
 - (void)morphTick:(CADisplayLink *)link {
+    if (self.morphUsesGlass) {
+        double p = (CACurrentMediaTime() - self.morphStartTime) / 0.55;
+        if (p >= 1.0) { [self finishEntranceMorph]; return; }
+        if (p < 0.0) p = 0.0;
+        double e = (p < 0.5) ? (4.0 * p * p * p) : (1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0);
+        CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+        CGRect start = CGRectMake(w * 0.06, h * 0.07, w * 0.88, h * 0.82);
+        CGRect end = CGRectMake(self.frontRestCenter.x - self.frontRestSize.width * 0.5,
+                                self.frontRestCenter.y - self.frontRestSize.height * 0.5,
+                                self.frontRestSize.width, self.frontRestSize.height);
+        self.glassView.overrideRect = CGRectMake(start.origin.x + (end.origin.x - start.origin.x) * (CGFloat)e,
+                                                 start.origin.y + (end.origin.y - start.origin.y) * (CGFloat)e,
+                                                 start.size.width + (end.size.width - start.size.width) * (CGFloat)e,
+                                                 start.size.height + (end.size.height - start.size.height) * (CGFloat)e);
+        self.glassView.overrideRadius = 46.0 + (self.frontRestRadius - 46.0) * (CGFloat)pow(e, 1.15);
+        // Speed-tracked blur on the fixed-size stage veil (alpha only — no resizing).
+        self.entranceBlurVeil.alpha = (CGFloat)(sin(M_PI * p) * MIN(0.55, MAX(0.15, kMotionBlurIntensity / 16.0)));
+        if (p > 0.62) {
+            self.carouselContentLayer.alpha = MIN(1.0, (CGFloat)((p - 0.62) / 0.25));
+        }
+        return;
+    }
     UIView *morph = self.entranceMorphView;
     if (!morph) { [self finishEntranceMorph]; return; }
     double p = (CACurrentMediaTime() - self.morphStartTime) / 0.55;
@@ -785,6 +1184,14 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     self.morphActive = NO;
     [self.morphDisplayLink invalidate];
     self.morphDisplayLink = nil;
+    if (self.morphUsesGlass) {
+        // The override shape has landed exactly on the front item's real glass
+        // shape — handing back to the plain shape list is seamless.
+        self.morphUsesGlass = NO;
+        self.glassView.overrideIndex = -1;
+        self.entranceBlurVeil.alpha = 0.0;
+        self.entranceBlurVeil.hidden = YES;
+    }
     [self.entranceMorphView removeFromSuperview];
     self.entranceMorphView = nil;
     self.entranceMorphIcon = nil;
@@ -1041,6 +1448,10 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     if (count == 0) {
         self.topHeaderPill.hidden = YES;
         self.closeButton.hidden = YES;
+        if (self.glassActive) {
+            self.glassFrontShapeIndex = -1;
+            [self.glassView updateShapesWithRects:@[] radii:@[]];
+        }
         self.isLayingOutCarousel = NO;
         return;
     }
@@ -1050,6 +1461,12 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     // Computed ONCE per layout pass: this colour was previously re-created for every
     // item on every frame of a drag - pure allocation churn on the main thread.
     UIColor *itemBorderColor = (kLiquidGlass && kGlowIntensity > 0.01) ? CSDispersedGlowColor(MIN(0.95, 0.45 + kGlowIntensity * 0.50)) : nil;
+
+    // 2.2.7: while the real-glass engine is live, each layout pass also collects
+    // the shapes the shader draws (visual rects in stage points + corner radii).
+    NSMutableArray<NSValue *> *glassRects = self.glassActive ? [NSMutableArray array] : nil;
+    NSMutableArray<NSNumber *> *glassRadii = self.glassActive ? [NSMutableArray array] : nil;
+    NSMutableArray<NSNumber *> *glassItemIndices = self.glassActive ? [NSMutableArray array] : nil;
 
     NSInteger bestIdx = 0;
     double bestCos = -999.0;
@@ -1168,10 +1585,25 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         // view blurs whatever sits behind it), so a neighbouring orb no longer ghosts
         // through it where the two overlap.
         CGFloat bgAlpha = 0.86 + 0.12 * (CGFloat)frontWeight;
-        NSInteger bgBucket = (NSInteger)lround(bgAlpha * 24.0);
-        if (bgBucket != item.lastBgAlphaBucket) {
-            item.lastBgAlphaBucket = bgBucket;
-            item.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.19 alpha:bgAlpha];
+        if (self.glassActive) {
+            // 2.2.7: the Metal glass view draws this item's body. The item itself
+            // goes transparent (icon, label and the one front border stay) and its
+            // live blur view is hidden — one shared glass pass replaces N
+            // per-item UIVisualEffectViews, the suspected swipe-stutter source.
+            if (item.lastBgAlphaBucket != -999) {
+                item.lastBgAlphaBucket = -999;
+                item.backgroundColor = [UIColor clearColor];
+            }
+            item.frostedGlassView.hidden = YES;
+            item.ambientIconBG.hidden = YES;
+        } else {
+            NSInteger bgBucket = (NSInteger)lround(bgAlpha * 24.0);
+            if (bgBucket != item.lastBgAlphaBucket) {
+                item.lastBgAlphaBucket = bgBucket;
+                item.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.19 alpha:bgAlpha];
+            }
+            item.frostedGlassView.hidden = NO;
+            item.ambientIconBG.hidden = NO;
         }
 
         // Border and glass rim share the item's own layer path & corner radius, and the rim
@@ -1248,6 +1680,18 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         }
         tx = CATransform3DScale(tx, depthScale, depthScale, 1.0);
         item.layer.transform = tx;
+
+        if (glassRects && !item.hidden && glassRects.count < 14) {
+            // The shader draws flat shapes: use the item's VISUAL rect (centre +
+            // depth-scaled size), inset slightly so the flat glass stays inside
+            // the silhouette of the Y-rotated item at steep angles.
+            CGFloat inset = 1.0 - MIN(0.10, fabs(sinT) * 0.10);
+            CGFloat gw = itemW * depthScale * inset;
+            CGFloat gh = itemH * depthScale * inset;
+            [glassRects addObject:[NSValue valueWithCGRect:CGRectMake(posX - gw * 0.5, posY - gh * 0.5, gw, gh)]];
+            [glassRadii addObject:@(cornerR * depthScale * inset)];
+            [glassItemIndices addObject:@(i)];
+        }
     }
 
     self.frontItemIndex = bestIdx;
@@ -1283,7 +1727,130 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         self.closeButton.center = CGPointMake(w * 0.5, closeY);
     }
 
+    if (glassRects) {
+        // The header pill and the close button join the same glass pass, so the
+        // whole stage reads as one material. Items keep priority for the 16
+        // shader slots; the two chrome shapes take whatever room is left.
+        NSUInteger frontPos = [glassItemIndices indexOfObject:@(bestIdx)];
+        self.glassFrontShapeIndex = (frontPos == NSNotFound) ? -1 : (NSInteger)frontPos;
+        if (!self.topHeaderPill.hidden && glassRects.count < 16) {
+            [glassRects addObject:[NSValue valueWithCGRect:self.topHeaderPill.frame]];
+            [glassRadii addObject:@(21.0)];
+        }
+        if (!self.closeButton.hidden && glassRects.count < 16) {
+            [glassRects addObject:[NSValue valueWithCGRect:self.closeButton.frame]];
+            [glassRadii addObject:@(22.0)];
+        }
+        [self.glassView updateShapesWithRects:glassRects radii:glassRadii];
+    }
+
     self.isLayingOutCarousel = NO;
+}
+
+// Attempts to bring the real-glass engine up for this open: compiles the
+// shader (usually already warm from %ctor), places the backdrop capture view
+// under the stage and snapshots the scene behind the switcher ONCE. Returns
+// NO on any failure — the caller then keeps the frosted fallback untouched.
+- (BOOL)_cs_prepareGlass {
+    if (!kLiquidGlass) return NO;
+    if (![[CSGlassEngine shared] prepare]) return NO;
+    UIView *parent = self.superview;
+    if (!parent) return NO;
+
+    if (!self.glassView) {
+        self.glassView = [[CSGlassView alloc] initWithFrame:self.bounds];
+        self.glassView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        self.glassView.hidden = YES;
+        [self insertSubview:self.glassView belowSubview:self.carouselContentLayer];
+    }
+    if (!self.backdropView) {
+        self.backdropView = [[CSBackdropView alloc] initWithFrame:self.frame];
+    }
+    if (self.backdropView.superview != parent) {
+        [parent insertSubview:self.backdropView belowSubview:self];
+    }
+    self.backdropView.frame = self.frame;
+
+    id<MTLTexture> texture = [self.glassView captureBackdropView:self.backdropView];
+    if (!texture) return NO;
+    self.glassView.backgroundTexture = texture;
+
+    // Hedge against a first-frame capture taken before the render server has
+    // composited this presentation: re-capture once shortly after settling and
+    // swap the texture if the second shot succeeds.
+    CFTimeInterval token = CACurrentMediaTime();
+    self.glassCaptureToken = token;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self.glassCaptureToken != token || !self.glassActive || self.hidden) return;
+        id<MTLTexture> fresh = [self.glassView captureBackdropView:self.backdropView];
+        if (fresh) {
+            self.glassView.backgroundTexture = fresh;
+            [self.glassView setNeedsDisplay];
+        }
+    });
+    return YES;
+}
+
+- (void)_cs_setGlassActive:(BOOL)active {
+    self.glassActive = active;
+    self.glassView.hidden = !active;
+    if (active) {
+        self.savedPillColor = self.topHeaderPill.backgroundColor;
+        self.savedCloseColor = self.closeButton.backgroundColor;
+        self.topHeaderPill.backgroundColor = [UIColor clearColor];
+        self.closeButton.backgroundColor = [UIColor clearColor];
+    } else {
+        if (self.savedPillColor) self.topHeaderPill.backgroundColor = self.savedPillColor;
+        if (self.savedCloseColor) self.closeButton.backgroundColor = self.savedCloseColor;
+        self.glassView.overrideIndex = -1;
+    }
+    // Force every item's background bucket to re-evaluate under the new mode.
+    for (CSInfiniteCarouselItem *item in self.items) item.lastBgAlphaBucket = -1;
+    [self layoutCarousel3D];
+}
+
+// App-open exit for the glass stage: the front item's glass shape itself grows
+// to fill the screen while the stage fades (see _cs_activateAppLayout), so the
+// eye follows ONE continuous object into the app instead of a fade racing
+// SpringBoard's own zoom on a separate clock.
+- (void)_cs_beginAppExpand {
+    if (!self.glassActive || self.expandActive) return;
+    if (self.glassFrontShapeIndex < 0 || self.frontRestSize.width < 10.0) return;
+    self.expandActive = YES;
+    self.expandStartTime = CACurrentMediaTime();
+    self.expandFromRect = CGRectMake(self.frontRestCenter.x - self.frontRestSize.width * 0.5,
+                                     self.frontRestCenter.y - self.frontRestSize.height * 0.5,
+                                     self.frontRestSize.width, self.frontRestSize.height);
+    self.expandFromRadius = self.frontRestRadius;
+    self.glassView.overrideIndex = self.glassFrontShapeIndex;
+    self.glassView.overrideRect = self.expandFromRect;
+    self.glassView.overrideRadius = self.expandFromRadius;
+    self.expandDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(expandTick:)];
+    [self.expandDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)expandTick:(CADisplayLink *)link {
+    double p = (CACurrentMediaTime() - self.expandStartTime) / 0.30;
+    if (p >= 1.0) {
+        [self _cs_stopAppExpand];
+        return;
+    }
+    if (p < 0.0) p = 0.0;
+    double e = 1.0 - pow(1.0 - p, 3.0); // easeOutCubic
+    CGRect start = self.expandFromRect;
+    CGRect end = self.bounds;
+    self.glassView.overrideRect = CGRectMake(start.origin.x + (end.origin.x - start.origin.x) * (CGFloat)e,
+                                             start.origin.y + (end.origin.y - start.origin.y) * (CGFloat)e,
+                                             start.size.width + (end.size.width - start.size.width) * (CGFloat)e,
+                                             start.size.height + (end.size.height - start.size.height) * (CGFloat)e);
+    self.glassView.overrideRadius = self.expandFromRadius + (40.0 - self.expandFromRadius) * (CGFloat)e;
+}
+
+- (void)_cs_stopAppExpand {
+    self.expandActive = NO;
+    [self.expandDisplayLink invalidate];
+    self.expandDisplayLink = nil;
+    if (!self.morphUsesGlass) self.glassView.overrideIndex = -1;
 }
 
 - (void)physicsTick:(CADisplayLink *)link {
@@ -1387,6 +1954,9 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 }
 
 - (void)handleTap:(UITapGestureRecognizer *)tap {
+    // An exit to Home is already in flight (see _cs_dismissSwitcherToHome):
+    // ignore taps so nothing can race it, while the carousel stays alive.
+    if (self.dismissPending) return;
     CGPoint pt = [tap locationInView:self];
 
     if (!self.closeButton.hidden && CGRectContainsPoint(CGRectInset(self.closeButton.frame, -10, -10), pt)) {
@@ -1473,6 +2043,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 // app, which read as 'the x does not close everything'). Swipe-up on the front app
 // still kills just that one app via handleKillFrontApp:.
 - (void)handleCloseAllApps:(id)sender {
+    if (self.dismissPending) return; // an exit to Home is already in flight
     if (self.items.count == 0) return;
     if (kHapticFeedback) {
         UIImpactFeedbackGenerator *killGen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -1830,21 +2401,16 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     }
     [self _cs_updateClassicTitleLabel:targetView];
 
-    if (kLiquidGlass && kGlowIntensity > 0.01) {
-        // Glow hugs the card itself: the shadow path is the page view's rounded rect.
-        // A plain container shadow used the container's bigger, offset frame and drew
-        // the extra ghost frame around classic cards.
-        CGFloat cardRadius = targetView.layer.cornerRadius;
-        if (cardRadius < 1.0) cardRadius = 28.0;
-        self.layer.shadowColor = CSActiveGlowColor(1.0).CGColor;
-        self.layer.shadowOpacity = (float)(kGlowIntensity * MAX(0.25, 1.0 - absT * 0.45));
-        self.layer.shadowRadius = 18.0;
-        self.layer.shadowOffset = CGSizeMake(0, 6);
-        self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:targetView.frame cornerRadius:cardRadius].CGPath;
-    } else {
-        self.layer.shadowOpacity = 0.0;
-        self.layer.shadowPath = nil;
-    }
+    // 2.2.7: NO glow shadow on the container in classic modes. The shadow lived
+    // on THIS layer with a flat, unrotated path while the card inside is
+    // Y-rotated, and the front container renders above the rear card — so its
+    // warm glow painted a milky veil OVER the neighbouring app (the user's
+    // 2.2.6 test photos: a yellow-orange layer from the front app covering
+    // part of the app behind). The classic glow now lives only in the page
+    // view's own 2pt border (see SBAppSwitcherPageView layoutSubviews), which
+    // is clipped to the card itself and can never cross onto another app.
+    self.layer.shadowOpacity = 0.0;
+    self.layer.shadowPath = nil;
 }
 
 %new
@@ -2029,6 +2595,12 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             stage.alpha = 1.0;
             kCSLastActivationTime = CACurrentMediaTime();
             stage.userInteractionEnabled = YES;
+            stage.dismissPending = NO;
+            // 2.2.7: try the real-glass engine for this open — backdrop captured
+            // once, embedded shader compiled on-device. ANY failure keeps the
+            // frosted fallback exactly as it was (see _cs_prepareGlass). Runs
+            // before the entrance so the glass morph can take over when live.
+            [stage _cs_setGlassActive:[stage _cs_prepareGlass]];
             if (wasHidden) {
                 if ((CACurrentMediaTime() - kCSLastTransitionBeginTime) <= 0.45) {
                     // Early attach (the normal open): run the entrance morph. It rides
@@ -2047,11 +2619,16 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             // Safety fallback: if 0 apps found, keep native switcher 100% visible & interactive!
             stage.hidden = YES;
             stage.userInteractionEnabled = NO;
+            [stage _cs_setGlassActive:NO];
+            [stage.backdropView removeFromSuperview];
             CSSetNativeSwitcherViewsHidden(self.view, stage, NO);
         }
     } else {
         if (stage) {
             [stage stopPhysics];
+            [stage _cs_setGlassActive:NO];
+            stage.dismissPending = NO;
+            [stage.backdropView removeFromSuperview];
             stage.hidden = YES;
             stage.alpha = 0.0;
             stage.userInteractionEnabled = NO;
@@ -2099,17 +2676,16 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 
 %new
 - (void)_cs_dismissSwitcherToHome {
-    gSwitcherSettledOpen = NO;
-
-    // 2.2.5: send the 'go home' command FIRST and tear the overlay down afterwards.
-    // The old order restored the native switcher first, so whenever the home command
-    // was slow (or a selector missed on this iOS) the user landed on the DEFAULT
-    // switcher instead of the home screen after tapping empty space.
+    // 2.2.7: do NOT freeze the stage at tap time, and do NOT mark the switcher
+    // closed yet. 2.2.6 stopped the physics and cut interaction instantly, then
+    // waited for the system to begin its exit — that frozen gap read as lag
+    // ("tạm được, nhưng hơi lag"). The stage now stays fully alive until the
+    // exit transition actually begins; dismissPending makes the tap handler
+    // ignore further taps meanwhile so nothing can race the exit, and
+    // gSwitcherSettledOpen stays YES (headers stay hidden, watchdog semantics
+    // unchanged) until transitionDidEnd settles it.
     CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
-    if (stage) {
-        [stage stopPhysics];
-        stage.userInteractionEnabled = NO;
-    }
+    if (stage) stage.dismissPending = YES;
 
     BOOL sentHome = NO;
     @try {
@@ -2155,6 +2731,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         // fully interactive, exactly as it was before the tap.
         gSwitcherSettledOpen = YES;
         if (stage && !stage.hidden) {
+            stage.dismissPending = NO;
             stage.userInteractionEnabled = YES;
             [stage startPhysicsIfNeeded];
         }
@@ -2174,6 +2751,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         // overlay on screen.
         CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
         if (stage && !stage.hidden) {
+            stage.dismissPending = NO;
             stage.userInteractionEnabled = YES;
             [stage startPhysicsIfNeeded];
             if (stage.alpha < 1.0) {
@@ -2237,8 +2815,16 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     // If the activation silently failed, no exit transition begins and the exit
     // watchdog restores the stage's alpha and interactivity instead (see
     // _cs_scheduleExitWatchdog), so the user is never stranded on a faded overlay.
+    // 2.2.7: with the glass engine live, the front item's glass shape also grows
+    // to fill the screen across a slightly longer fade, so the open reads as one
+    // object expanding into the app instead of a fade racing the system's zoom.
     if (stage && !stage.hidden) {
-        [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+        BOOL expanding = NO;
+        if (stage.glassActive) {
+            [stage _cs_beginAppExpand];
+            expanding = stage.expandActive;
+        }
+        [UIView animateWithDuration:(expanding ? 0.32 : 0.2) delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
             stage.alpha = 0.0;
         } completion:nil];
     }
@@ -2321,6 +2907,12 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 %ctor {
     @autoreleasepool {
         CSLoadPreferences();
+        // Warm the Metal glass engine on a background queue so the first
+        // switcher open does not pay the one-time shader compile. Silent on
+        // failure: the glass stage simply stays on the frosted fallback.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [[CSGlassEngine shared] prepare];
+        });
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             NULL,
