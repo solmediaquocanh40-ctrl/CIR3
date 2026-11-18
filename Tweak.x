@@ -6,9 +6,9 @@
 #import <math.h>
 
 // ============================================================================
-// CircleSwitcher v2.2.5 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
+// CircleSwitcher v2.2.6 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
 // Supports iOS 14.0 - 16.3.1+ (Rootless & Rootful)
-// Critical Stability Fixes (v2.2.5):
+// Critical Stability Fixes (v2.2.6):
 //   - REMOVED drawViewHierarchyInRect: (eliminates GPU/WindowServer deadlock on iOS 16)
 //   - REMOVED viewDidLayoutSubviews mutation & recursive layoutSubviews loops
 //   - NEVER activates mid-swipe (only activates after transitionDidEnd into mode 2)
@@ -43,6 +43,8 @@
 - (void)_cs_setSwitcherActive:(BOOL)active;
 - (void)_cs_dismissSwitcherToHome;
 - (void)_cs_scheduleExitWatchdog;
+- (void)_cs_runExitGuardLoop;
+- (void)_cs_exitGuardStepWithToken:(CFTimeInterval)token passesLeft:(NSInteger)passesLeft;
 - (void)_cs_activateAppLayout:(id)appLayout bundleID:(NSString *)bundleID;
 - (void)_cs_killAppLayout:(id)appLayout bundleID:(NSString *)bundleID;
 @end
@@ -104,6 +106,11 @@ static const void *kCSClassicTitleLabelKey = &kCSClassicTitleLabelKey;
 static CFTimeInterval kCSLastActivationTime = 0;
 static CFTimeInterval kCSLastTransitionBeginTime = 0;
 static CFTimeInterval kCSLastExitRequestTime = 0;
+// 2.2.6 exit guard: YES from the moment an exit transition begins until it ends.
+// While set, a repeating pass re-hides the native switcher views so iOS can never
+// slip its own UI back under the overlay in the middle of an exit.
+static BOOL gCSExitInProgress = NO;
+static CFTimeInterval kCSExitGuardToken = 0;
 static BOOL CSUsesInfiniteCarouselOverlay(void); // forward declaration (defined below)
 
 // YES when the native per-card header must be forcibly hidden right now.
@@ -495,11 +502,13 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 @property (nonatomic, assign) BOOL isLayingOutCarousel;
 @property (nonatomic, assign) CGSize lastLayoutSize;
 - (NSInteger)reloadAppsFromSwitcher;
+- (CSInfiniteCarouselItem *)_cs_makeItemForLayout:(id)layout bundleID:(NSString *)bid halo:(UIImage *)haloImg rim:(UIImage *)rimImg stretchedRim:(UIImage *)stretchedRim;
 - (void)layoutCarousel3D;
 - (void)triggerSafeEntranceMotionBlur;
 - (void)startEntranceMorph;
 - (void)finishEntranceMorph;
 - (void)stopPhysics;
+- (void)startPhysicsIfNeeded;
 @end
 
 @implementation CSInfiniteCarouselStageView
@@ -796,6 +805,26 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     veil.hidden = next < 0.01;
 }
 
+- (CSInfiniteCarouselItem *)_cs_makeItemForLayout:(id)layout bundleID:(NSString *)bid halo:(UIImage *)haloImg rim:(UIImage *)rimImg stretchedRim:(UIImage *)stretchedRim {
+    CSInfiniteCarouselItem *item = [[CSInfiniteCarouselItem alloc] initWithFrame:CGRectMake(0, 0, 180, 320)];
+    item.appLayout = layout;
+    item.bundleID = bid;
+    item.displayName = CSAppDisplayNameForBundleID(bid);
+    item.titleLabel.text = item.displayName;
+
+    UIImage *appIcon = CSAppIconForBundleID(bid);
+    item.iconImageView.image = appIcon;
+    item.ambientIconBG.image = appIcon;
+
+    BOOL isCircularMode = (kLayoutMode == 1 || kLayoutMode == 2 || kLayoutMode == 3);
+    item.glassRimOverlay.image = isCircularMode ? rimImg : stretchedRim;
+
+    item.outerHaloView.image = haloImg;
+
+    [self.carouselContentLayer addSubview:item];
+    return item;
+}
+
 - (NSInteger)reloadAppsFromSwitcher {
     SBFluidSwitcherViewController *vc = self.ownerVC;
     if (!vc) return 0;
@@ -830,12 +859,10 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         }
     } @catch (NSException *e) {}
 
-    // Fast path: identical app set in identical order -> refresh layout references only.
-    // Previously every state/prefs call rebuilt all items from scratch and reset the spin
-    // angle to 0, which hitched the first frames of every open.
-    if ([layouts isKindOfClass:[NSArray class]] && layouts.count > 0 && self.items.count > 0) {
-        NSMutableArray<NSString *> *newIDs = [NSMutableArray array];
-        NSMutableArray *newLayouts = [NSMutableArray array];
+    // Build the incoming app list once (bundle IDs + layouts, capped at 24).
+    NSMutableArray<NSString *> *newIDs = [NSMutableArray array];
+    NSMutableArray *newLayouts = [NSMutableArray array];
+    if ([layouts isKindOfClass:[NSArray class]]) {
         for (id layout in layouts) {
             NSString *bid = CSBundleIDFromAppLayout(layout);
             if (bid.length > 0) {
@@ -844,13 +871,27 @@ static void CSReloadCallback(CFNotificationCenterRef center,
                 if (newIDs.count >= 24) break;
             }
         }
-        BOOL sameSet = (newIDs.count == self.items.count);
-        if (sameSet) {
-            for (NSInteger i = 0; i < (NSInteger)newIDs.count; i++) {
-                if (![newIDs[i] isEqualToString:self.items[i].bundleID]) { sameSet = NO; break; }
-            }
+    }
+
+    if (newIDs.count == 0) {
+        for (CSInfiniteCarouselItem *item in self.items) {
+            [item removeFromSuperview];
         }
-        if (sameSet) {
+        [self.items removeAllObjects];
+        self.topHeaderPill.hidden = YES;
+        self.closeButton.hidden = YES;
+        return 0;
+    }
+
+    // Fast path: identical app set in identical order -> refresh layout references only.
+    // Previously every state/prefs call rebuilt all items from scratch and reset the spin
+    // angle to 0, which hitched the first frames of every open.
+    if (self.items.count > 0 && newIDs.count == self.items.count) {
+        BOOL sameOrder = YES;
+        for (NSInteger i = 0; i < (NSInteger)newIDs.count; i++) {
+            if (![newIDs[i] isEqualToString:self.items[i].bundleID]) { sameOrder = NO; break; }
+        }
+        if (sameOrder) {
             for (NSInteger i = 0; i < (NSInteger)newLayouts.count; i++) {
                 self.items[i].appLayout = newLayouts[i];
             }
@@ -859,43 +900,63 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         }
     }
 
+    UIImage *haloImg = CSLoadAsset(@"orb_halo", YES);
+    UIImage *rimImg  = CSLoadAsset(@"glass_rim", NO);
+    UIImage *stretchedRim = rimImg ? [rimImg resizableImageWithCapInsets:UIEdgeInsetsMake(rimImg.size.height * 0.45, rimImg.size.width * 0.45, rimImg.size.height * 0.45, rimImg.size.width * 0.45) resizingMode:UIImageResizingModeStretch] : nil;
+
+    // 2.2.6 reuse path: opening an app reorders the recents, so the common case is
+    // "same apps, new order" (plus the occasional kill/launch). The old code tore
+    // down and rebuilt EVERY item on any difference - synchronously reloading every
+    // icon - and reset the spin to zero. Now surviving apps keep their existing item
+    // (icon, halo and rim already loaded); only departed apps are removed and only
+    // genuinely new apps get a fresh item. spinAngle is preserved, and
+    // layoutCarousel3D re-derives the front item from it, so the carousel never
+    // jumps back to zero.
+    if (self.items.count > 0) {
+        NSMutableDictionary<NSString *, CSInfiniteCarouselItem *> *existingByID = [NSMutableDictionary dictionary];
+        for (CSInfiniteCarouselItem *item in self.items) {
+            if (item.bundleID.length > 0 && !existingByID[item.bundleID]) {
+                existingByID[item.bundleID] = item;
+            }
+        }
+        NSMutableSet<CSInfiniteCarouselItem *> *kept = [NSMutableSet set];
+        NSMutableArray *ordered = [NSMutableArray arrayWithCapacity:newIDs.count];
+        BOOL anySurvivor = NO;
+        for (NSInteger i = 0; i < (NSInteger)newIDs.count; i++) {
+            CSInfiniteCarouselItem *item = existingByID[newIDs[i]];
+            if (item) {
+                item.appLayout = newLayouts[i];
+                [kept addObject:item];
+                [ordered addObject:item];
+                anySurvivor = YES;
+            } else {
+                [ordered addObject:[NSNull null]];
+            }
+        }
+        if (anySurvivor && [NSSet setWithArray:newIDs].count == newIDs.count) {
+            for (CSInfiniteCarouselItem *item in self.items) {
+                if (![kept containsObject:item]) [item removeFromSuperview];
+            }
+            for (NSInteger i = 0; i < (NSInteger)ordered.count; i++) {
+                if (ordered[i] == [NSNull null]) {
+                    ordered[i] = [self _cs_makeItemForLayout:newLayouts[i] bundleID:newIDs[i] halo:haloImg rim:rimImg stretchedRim:stretchedRim];
+                }
+            }
+            [self.items removeAllObjects];
+            [self.items addObjectsFromArray:ordered];
+            [self layoutCarousel3D];
+            return (NSInteger)self.items.count;
+        }
+    }
+
+    // Full rebuild: no survivors (first open, or a completely different app set).
     for (CSInfiniteCarouselItem *item in self.items) {
         [item removeFromSuperview];
     }
     [self.items removeAllObjects];
 
-    if (![layouts isKindOfClass:[NSArray class]] || layouts.count == 0) {
-        self.topHeaderPill.hidden = YES;
-        self.closeButton.hidden = YES;
-        return 0;
-    }
-
-    UIImage *haloImg = CSLoadAsset(@"orb_halo", YES);
-    UIImage *rimImg  = CSLoadAsset(@"glass_rim", NO);
-    UIImage *stretchedRim = rimImg ? [rimImg resizableImageWithCapInsets:UIEdgeInsetsMake(rimImg.size.height * 0.45, rimImg.size.width * 0.45, rimImg.size.height * 0.45, rimImg.size.width * 0.45) resizingMode:UIImageResizingModeStretch] : nil;
-
-    NSInteger maxApps = MIN((NSInteger)layouts.count, 24);
-    for (NSInteger idx = 0; idx < maxApps; idx++) {
-        id layout = layouts[idx];
-        NSString *bid = CSBundleIDFromAppLayout(layout);
-        if (!bid || bid.length == 0) continue;
-
-        CSInfiniteCarouselItem *item = [[CSInfiniteCarouselItem alloc] initWithFrame:CGRectMake(0, 0, 180, 320)];
-        item.appLayout = layout;
-        item.bundleID = bid;
-        item.displayName = CSAppDisplayNameForBundleID(bid);
-        item.titleLabel.text = item.displayName;
-
-        UIImage *appIcon = CSAppIconForBundleID(bid);
-        item.iconImageView.image = appIcon;
-        item.ambientIconBG.image = appIcon;
-
-        BOOL isCircularMode = (kLayoutMode == 1 || kLayoutMode == 2 || kLayoutMode == 3);
-        item.glassRimOverlay.image = isCircularMode ? rimImg : stretchedRim;
-
-        item.outerHaloView.image = haloImg;
-
-        [self.carouselContentLayer addSubview:item];
+    for (NSInteger idx = 0; idx < (NSInteger)newIDs.count; idx++) {
+        CSInfiniteCarouselItem *item = [self _cs_makeItemForLayout:newLayouts[idx] bundleID:newIDs[idx] halo:haloImg rim:rimImg stretchedRim:stretchedRim];
         [self.items addObject:item];
     }
 
@@ -1882,6 +1943,19 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self _cs_setSwitcherActive:YES];
                 });
+            } else if (toMode == 1 || toMode == 3) {
+                // 2.2.6 exit guard: on some iOS builds the system re-shows / re-layouts
+                // its native switcher views DURING the exit animation, which is how the
+                // stock switcher kept leaking through even with teardown deferred to
+                // DidEnd. Nothing is torn down here either - instead the native views
+                // are re-hidden immediately (post-%orig) and a short loop keeps them
+                // hidden until DidEnd, while the overlay rides out untouched on top.
+                gCSExitInProgress = YES;
+                CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
+                if (stage && !stage.hidden) {
+                    CSSetNativeSwitcherViewsHidden(self.view, stage, YES);
+                    [self _cs_runExitGuardLoop];
+                }
             }
             // Leaving the switcher (to Home=1 or App=3): do NOT tear anything down here.
             // Tearing down at transition BEGIN restored the native views for the entire
@@ -1904,6 +1978,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             NSInteger toMode = [toModeObj integerValue];
             BOOL open = (toMode == 2);
             gSwitcherSettledOpen = open;
+            gCSExitInProgress = NO; // any completed transition ends the exit guard
             // Activate asynchronously AFTER SpringBoard transition finishes -> ZERO mid-swipe hang!
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self _cs_setSwitcherActive:open];
@@ -1999,6 +2074,30 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 }
 
 %new
+- (void)_cs_runExitGuardLoop {
+    CFTimeInterval token = CACurrentMediaTime();
+    kCSExitGuardToken = token;
+    [self _cs_exitGuardStepWithToken:token passesLeft:30];
+}
+
+%new
+- (void)_cs_exitGuardStepWithToken:(CFTimeInterval)token passesLeft:(NSInteger)passesLeft {
+    // ~40ms re-hide passes for the length of a typical exit (30 passes ≈ 1.2s cap,
+    // so the loop can never outlive its transition even if DidEnd is somehow missed).
+    if (!gCSExitInProgress || token != kCSExitGuardToken || passesLeft <= 0) return;
+    CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
+    if (stage && !stage.hidden) {
+        CSSetNativeSwitcherViewsHidden(self.view, stage, YES);
+        if (self.view.subviews.lastObject != stage) {
+            [self.view bringSubviewToFront:stage];
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self _cs_exitGuardStepWithToken:token passesLeft:passesLeft - 1];
+    });
+}
+
+%new
 - (void)_cs_dismissSwitcherToHome {
     gSwitcherSettledOpen = NO;
 
@@ -2048,7 +2147,17 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
         // after a fast re-open and kill the fresh stage.)
         [self _cs_scheduleExitWatchdog];
     } else {
-        [self _cs_setSwitcherActive:NO];
+        // 2.2.6: NEVER reveal the stock switcher as a fallback. The old code called
+        // _cs_setSwitcherActive:NO here, restoring the native views on the spot - so
+        // whenever every home selector missed on this iOS build, tapping empty space
+        // swapped CircleSwitcher for the DEFAULT switcher. That was the #1 bug, by
+        // design. The switcher is still open, so stay in it: hand the stage back
+        // fully interactive, exactly as it was before the tap.
+        gSwitcherSettledOpen = YES;
+        if (stage && !stage.hidden) {
+            stage.userInteractionEnabled = YES;
+            [stage startPhysicsIfNeeded];
+        }
     }
 }
 
@@ -2058,11 +2167,19 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     CFTimeInterval token = kCSLastExitRequestTime;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (kCSLastExitRequestTime != token) return; // a newer exit/open superseded this one
+        if (gCSExitInProgress) return;              // exit under way; DidEnd owns teardown
         if (!gSwitcherSettledOpen) return;           // the transition ran; DidEnd cleaned up
         // The exit never actually started (command swallowed): give the switcher back
-        // instead of leaving a frozen overlay on screen.
+        // instead of leaving a frozen (or faded-out, after a failed app activation)
+        // overlay on screen.
         CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
-        if (stage && !stage.hidden) stage.userInteractionEnabled = YES;
+        if (stage && !stage.hidden) {
+            stage.userInteractionEnabled = YES;
+            [stage startPhysicsIfNeeded];
+            if (stage.alpha < 1.0) {
+                [UIView animateWithDuration:0.15 animations:^{ stage.alpha = 1.0; }];
+            }
+        }
     });
 }
 
@@ -2112,6 +2229,18 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
                 ((void (*)(id, SEL, id, BOOL))objc_msgSend)(sbApp, launchSel, bundleID, NO);
             }
         } @catch (NSException *e) {}
+    }
+
+    // 2.2.6: fade the stage out over ~0.2s as the app takes over. Previously the
+    // stage stayed frozen at full opacity for the entire exit and then vanished in
+    // a single hard cut at transitionDidEnd - a visible jerk on every app open.
+    // If the activation silently failed, no exit transition begins and the exit
+    // watchdog restores the stage's alpha and interactivity instead (see
+    // _cs_scheduleExitWatchdog), so the user is never stranded on a faded overlay.
+    if (stage && !stage.hidden) {
+        [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+            stage.alpha = 0.0;
+        } completion:nil];
     }
 }
 

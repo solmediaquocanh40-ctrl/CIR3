@@ -21,8 +21,8 @@
     badge.textAlignment = NSTextAlignmentCenter;
     badge.font = [UIFont systemFontOfSize:16.5 weight:UIFontWeightSemibold];
     badge.text = isEnglish
-        ? @"CircleSwitcher v2.2.5\n\nBuilt for iOS 14 - 16.3.1+ (Rootless & Rootful)\n3D Hologram Cylinder & Liquid Glass Engine\n\nDouble-tap anywhere for tracks"
-        : @"CircleSwitcher v2.2.5\n\nHỗ trợ iOS 14 - 16.3.1+ (Rootless & Rootful)\nVòng Trụ 3D Hologram & Kính Lỏng\n\nChạm đúp vào màn hình để mở danh sách nhạc";
+        ? @"CircleSwitcher v2.2.6\n\nBuilt for iOS 14 - 16.3.1+ (Rootless & Rootful)\n3D Hologram Cylinder & Liquid Glass Engine\n\nDouble-tap anywhere for tracks"
+        : @"CircleSwitcher v2.2.6\n\nHỗ trợ iOS 14 - 16.3.1+ (Rootless & Rootful)\nVòng Trụ 3D Hologram & Kính Lỏng\n\nChạm đúp vào màn hình để mở danh sách nhạc";
 
     [self.view addSubview:badge];
     [NSLayoutConstraint activateConstraints:@[
