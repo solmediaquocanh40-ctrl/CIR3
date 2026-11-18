@@ -730,7 +730,7 @@
 			<key>label</key>
 			<string>ÁP DỤNG &amp; KHỞI ĐỘNG LẠI</string>
 			<key>footerText</key>
-			<string>CircleSwitcher v2.2.0 — Rootless &amp; Rootful (iOS 14 - 16.3.1+)</string>
+			<string>CircleSwitcher v2.2.2 — Rootless &amp; Rootful (iOS 14 - 16.3.1+)</string>
 		</dict>
 		<dict>
 			<key>cell</key>

@@ -16,7 +16,7 @@
 
         UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
         titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        titleLabel.text = @"CircleSwitcher 2.2.0";
+        titleLabel.text = @"CircleSwitcher 2.2.2";
         titleLabel.font = [UIFont systemFontOfSize:24.0 weight:UIFontWeightBold];
         titleLabel.textAlignment = NSTextAlignmentCenter;
         if (@available(iOS 13.0, *)) {

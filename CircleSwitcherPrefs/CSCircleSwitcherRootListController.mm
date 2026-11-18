@@ -93,7 +93,7 @@ static UIColor *CSColorFromHueDegrees(CGFloat hueDeg) {
     // Hidden Pull-Down Easter Egg Header inside TableView
     UIButton *secretBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     secretBtn.frame = CGRectMake(0, 0, self.view.bounds.size.width, 32);
-    [secretBtn setTitle:@"CircleSwitcher 2.2.0" forState:UIControlStateNormal];
+    [secretBtn setTitle:@"CircleSwitcher 2.2.2" forState:UIControlStateNormal];
     secretBtn.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightMedium];
     secretBtn.alpha = 0.45;
     [secretBtn addTarget:self action:@selector(openEasterEgg) forControlEvents:UIControlEventTouchUpInside];
@@ -164,6 +164,13 @@ static UIColor *CSColorFromHueDegrees(CGFloat hueDeg) {
         YES
     );
 
+    // Debounced: sliders fire setPreferenceValue: on every drag tick, and rebuilding
+    // the whole preview each tick is what made Settings transitions hitch.
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_cs_refreshStickyPreview) object:nil];
+    [self performSelector:@selector(_cs_refreshStickyPreview) withObject:nil afterDelay:0.05];
+}
+
+- (void)_cs_refreshStickyPreview {
     [self.stickyPreviewHeader reloadPreviewFromPreferences];
 }
 
@@ -397,7 +404,7 @@ static UIColor *CSColorFromHueDegrees(CGFloat hueDeg) {
 }
 
 - (void)shareTweak {
-    NSString *text = @"Loving #CircleSwitcher 2.2.0 — 3D Hologram Cylinder, Orbital Orbs & Liquid Glass Switcher for iOS!";
+    NSString *text = @"Loving #CircleSwitcher 2.2.2 — 3D Hologram Cylinder, Orbital Orbs & Liquid Glass Switcher for iOS!";
     UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[text] applicationActivities:nil];
     vc.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
     [self presentViewController:vc animated:YES completion:nil];
