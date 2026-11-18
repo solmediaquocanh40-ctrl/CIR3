@@ -6,9 +6,9 @@
 #import <math.h>
 
 // ============================================================================
-// CircleSwitcher v2.2.2 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
+// CircleSwitcher v2.2.5 — Anti-Freeze 360° Infinite Carousel & Native Fullscreen Engine
 // Supports iOS 14.0 - 16.3.1+ (Rootless & Rootful)
-// Critical Stability Fixes (v2.2.2):
+// Critical Stability Fixes (v2.2.5):
 //   - REMOVED drawViewHierarchyInRect: (eliminates GPU/WindowServer deadlock on iOS 16)
 //   - REMOVED viewDidLayoutSubviews mutation & recursive layoutSubviews loops
 //   - NEVER activates mid-swipe (only activates after transitionDidEnd into mode 2)
@@ -42,6 +42,7 @@
 - (void)_cs_handlePrefsOrStateChanged;
 - (void)_cs_setSwitcherActive:(BOOL)active;
 - (void)_cs_dismissSwitcherToHome;
+- (void)_cs_scheduleExitWatchdog;
 - (void)_cs_activateAppLayout:(id)appLayout bundleID:(NSString *)bundleID;
 - (void)_cs_killAppLayout:(id)appLayout bundleID:(NSString *)bundleID;
 @end
@@ -102,12 +103,13 @@ static const void *kCSHeaderOrigCenterKey = &kCSHeaderOrigCenterKey;
 static const void *kCSClassicTitleLabelKey = &kCSClassicTitleLabelKey;
 static CFTimeInterval kCSLastActivationTime = 0;
 static CFTimeInterval kCSLastTransitionBeginTime = 0;
+static CFTimeInterval kCSLastExitRequestTime = 0;
 static BOOL CSUsesInfiniteCarouselOverlay(void); // forward declaration (defined below)
 
 // YES when the native per-card header must be forcibly hidden right now.
 static BOOL CSShouldHideNativeHeader(void) {
     if (!kEnabled || !gSwitcherSettledOpen) return NO;
-    // Overlay draws its own titles; classic (2.2.2+) also draws its own per-card labels,
+    // Overlay draws its own titles; classic (2.2.5+) also draws its own per-card labels,
     // so the native header is hidden in EVERY mode/position while the switcher is open.
     return YES;
 }
@@ -377,6 +379,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIImageView *outerHaloView;
 @property (nonatomic, assign) double lastTheta;
+@property (nonatomic, assign) NSInteger lastBgAlphaBucket;
 @end
 
 @implementation CSInfiniteCarouselItem
@@ -464,6 +467,15 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 @property (nonatomic, strong) UIView *baseRingView;
 @property (nonatomic, strong) UIView *carouselContentLayer;
 @property (nonatomic, strong) UIVisualEffectView *entranceBlurVeil;
+@property (nonatomic, assign) CGPoint frontRestCenter;
+@property (nonatomic, assign) CGSize frontRestSize;
+@property (nonatomic, assign) CGFloat frontRestRadius;
+@property (nonatomic, strong) UIView *entranceMorphView;
+@property (nonatomic, strong) UIImageView *entranceMorphIcon;
+@property (nonatomic, strong) UIVisualEffectView *entranceMorphBlur;
+@property (nonatomic, strong) CADisplayLink *morphDisplayLink;
+@property (nonatomic, assign) CFTimeInterval morphStartTime;
+@property (nonatomic, assign) BOOL morphActive;
 @property (nonatomic, strong) UIView *topHeaderPill;
 @property (nonatomic, strong) UIImageView *topHeaderIcon;
 @property (nonatomic, strong) UILabel *topHeaderLabel;
@@ -485,6 +497,8 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 - (NSInteger)reloadAppsFromSwitcher;
 - (void)layoutCarousel3D;
 - (void)triggerSafeEntranceMotionBlur;
+- (void)startEntranceMorph;
+- (void)finishEntranceMorph;
 - (void)stopPhysics;
 @end
 
@@ -516,6 +530,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         [self addSubview:self.ambientBackdropView];
 
         self.hologramBaseView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 320)];
+        self.hologramBaseView.hidden = YES; // removed feature - see layoutCarousel3D
         self.hologramBaseView.userInteractionEnabled = NO;
         [self addSubview:self.hologramBaseView];
 
@@ -626,6 +641,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     }
     self.angularVelocity = 0.0;
     self.isSnapping = NO;
+    [self finishEntranceMorph];
 }
 
 - (void)startPhysicsIfNeeded {
@@ -647,6 +663,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 
     self.carouselContentLayer.transform = CGAffineTransformMakeScale(1.03, 1.03);
     self.carouselContentLayer.alpha = 0.0;
+    self.entranceBlurVeil.hidden = NO; // spin blur may have hidden it at alpha ~0
     self.entranceBlurVeil.alpha = MIN(0.45, MAX(0.10, kMotionBlurIntensity / 22.0));
 
     [UIView animateWithDuration:0.20 delay:0 usingSpringWithDamping:0.90 initialSpringVelocity:0.3 options:(UIViewAnimationOptions)UIViewAnimationOptionAllowUserInteraction animations:^{
@@ -654,6 +671,129 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         self.carouselContentLayer.alpha = 1.0;
         self.entranceBlurVeil.alpha = 0.0;
     } completion:nil];
+}
+
+// ===== Entrance morph (user-approved concept, from his demo video) =====
+// The front item starts as a big rounded "screen" and pulls its four corners in
+// while shrinking into its carousel slot; a blur veil tracks the morph speed
+// (strongest mid-flight, zero at both ends) so the open reads as ONE smooth
+// motion instead of the old pop + one-frame jerk. The real carousel fades in
+// underneath as the morph lands exactly on the front item's resting frame.
+- (void)startEntranceMorph {
+    if (self.morphActive || !kMotionBlurOn) return;
+    if (!CSUsesInfiniteCarouselOverlay()) return;
+    if (self.items.count == 0 || self.frontRestSize.width < 10.0) {
+        [self layoutCarousel3D];
+        if (self.items.count == 0 || self.frontRestSize.width < 10.0) return;
+    }
+    NSInteger idx = self.frontItemIndex;
+    if (idx < 0 || idx >= (NSInteger)self.items.count) idx = 0;
+    CSInfiniteCarouselItem *front = self.items[idx];
+    UIImage *iconImg = front.iconImageView.image;
+    if (!iconImg) return;
+
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    UIView *morph = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w * 0.88, h * 0.82)];
+    morph.center = CGPointMake(w * 0.5, h * 0.48);
+    morph.backgroundColor = [UIColor clearColor];
+    morph.clipsToBounds = YES;
+    morph.layer.cornerRadius = 46.0;
+    morph.layer.zPosition = 860.0;
+    morph.userInteractionEnabled = NO;
+
+    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
+    glass.frame = morph.bounds;
+    glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    glass.userInteractionEnabled = NO;
+    [morph addSubview:glass];
+
+    UIView *tint = [[UIView alloc] initWithFrame:morph.bounds];
+    tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tint.backgroundColor = [CSActiveGlowColor(1.0) colorWithAlphaComponent:0.16];
+    tint.userInteractionEnabled = NO;
+    [morph addSubview:tint];
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:iconImg];
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+    [morph addSubview:icon];
+    self.entranceMorphIcon = icon;
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleRegular]];
+    blur.frame = morph.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blur.alpha = 0.0;
+    blur.userInteractionEnabled = NO;
+    [morph addSubview:blur];
+    self.entranceMorphBlur = blur;
+
+    [self addSubview:morph];
+    self.entranceMorphView = morph;
+
+    self.carouselContentLayer.alpha = 0.0;
+    self.topHeaderPill.hidden = YES;
+
+    self.morphActive = YES;
+    self.morphStartTime = CACurrentMediaTime();
+    self.morphDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(morphTick:)];
+    [self.morphDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)morphTick:(CADisplayLink *)link {
+    UIView *morph = self.entranceMorphView;
+    if (!morph) { [self finishEntranceMorph]; return; }
+    double p = (CACurrentMediaTime() - self.morphStartTime) / 0.55;
+    if (p >= 1.0) { [self finishEntranceMorph]; return; }
+    if (p < 0.0) p = 0.0;
+    double e = (p < 0.5) ? (4.0 * p * p * p) : (1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0);
+
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    CGFloat startW = w * 0.88, startH = h * 0.82;
+    CGPoint startC = CGPointMake(w * 0.5, h * 0.48);
+    CGFloat gw = startW + (self.frontRestSize.width - startW) * (CGFloat)e;
+    CGFloat gh = startH + (self.frontRestSize.height - startH) * (CGFloat)e;
+    morph.bounds = CGRectMake(0, 0, gw, gh);
+    morph.center = CGPointMake(startC.x + (self.frontRestCenter.x - startC.x) * (CGFloat)e,
+                               startC.y + (self.frontRestCenter.y - startC.y) * (CGFloat)e);
+    // Corners pull in as it shrinks: rounded rect -> the front item's own radius
+    // (a full circle in the orb modes), exactly like the demo.
+    morph.layer.cornerRadius = 46.0 + (self.frontRestRadius - 46.0) * (CGFloat)pow(e, 1.15);
+
+    CGFloat iconSide = MIN(gw, gh) * (0.46 + (0.76 - 0.46) * (CGFloat)e);
+    self.entranceMorphIcon.bounds = CGRectMake(0, 0, iconSide, iconSide);
+    self.entranceMorphIcon.center = CGPointMake(gw * 0.5, gh * 0.5);
+
+    // Motion blur follows speed: sin curve = calm at both ends, blurred mid-flight.
+    self.entranceMorphBlur.alpha = (CGFloat)(sin(M_PI * p) * MIN(0.55, MAX(0.15, kMotionBlurIntensity / 16.0)));
+
+    if (p > 0.62) {
+        self.carouselContentLayer.alpha = MIN(1.0, (CGFloat)((p - 0.62) / 0.25));
+        morph.alpha = 1.0 - MIN(1.0, MAX(0.0, (CGFloat)((p - 0.82) / 0.18)));
+    }
+}
+
+- (void)finishEntranceMorph {
+    if (!self.morphActive) return;
+    self.morphActive = NO;
+    [self.morphDisplayLink invalidate];
+    self.morphDisplayLink = nil;
+    [self.entranceMorphView removeFromSuperview];
+    self.entranceMorphView = nil;
+    self.entranceMorphIcon = nil;
+    self.entranceMorphBlur = nil;
+    self.carouselContentLayer.alpha = 1.0;
+    if (!self.hidden) [self layoutCarousel3D];
+}
+
+// ===== Spin motion blur =====
+// One stage-wide blur veil whose alpha tracks carousel speed: fast swipes get a
+// light blur that masks frame steps; at rest it is fully gone and everything is
+// crisp. A single extra view - no per-item filters - so it costs almost nothing.
+- (void)_cs_updateSpinBlur:(CGFloat)target {
+    UIVisualEffectView *veil = self.entranceBlurVeil;
+    CGFloat next = veil.alpha + (target - veil.alpha) * 0.35;
+    if (target <= 0.0 && next < 0.012) next = 0.0;
+    veil.alpha = next;
+    veil.hidden = next < 0.01;
 }
 
 - (NSInteger)reloadAppsFromSwitcher {
@@ -795,8 +935,11 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     self.ambientBackdropView.hidden = !kBackdropEnabled;
     self.ambientBackdropView.tintColor = [glowCol colorWithAlphaComponent:0.16 * MAX(0.25, kGlowIntensity)];
 
-    BOOL showBase = kHologramBaseEnabled && (kLayoutMode == 0 || kLayoutMode == 1 || kLayoutMode == 2);
-    self.hologramBaseView.hidden = !showBase;
+    // HOLOGRAM BASE REMOVED (user's order, 2026-11-18): the composite base with its
+    // dark band / horizontal seam is gone for good - it is never shown in any mode.
+    // The views still exist (harmless, always hidden) so no other code path changes.
+    BOOL showBase = NO;
+    self.hologramBaseView.hidden = YES;
     if (showBase) {
         CGFloat ringDim = MIN(w, h) * 0.84 * kBaseScale;
         self.hologramBaseView.layer.transform = CATransform3DIdentity;
@@ -843,6 +986,9 @@ static void CSReloadCallback(CFNotificationCenterRef center,
 
     double slotAngle = [self slotAngleForCount:count];
     double totalSpan = (double)count * slotAngle;
+    // Computed ONCE per layout pass: this colour was previously re-created for every
+    // item on every frame of a drag - pure allocation churn on the main thread.
+    UIColor *itemBorderColor = (kLiquidGlass && kGlowIntensity > 0.01) ? CSDispersedGlowColor(MIN(0.95, 0.45 + kGlowIntensity * 0.50)) : nil;
 
     NSInteger bestIdx = 0;
     double bestCos = -999.0;
@@ -896,10 +1042,10 @@ static void CSReloadCallback(CFNotificationCenterRef center,
             itemH = sz;
         } else if (kLayoutMode == 2) {
             double focus = MAX(0.0, cosT);
-            double focusSmooth = pow(focus, 2.2);
+            double focusSmooth = pow(focus, 3.0);
             // Cap the front orb by the angular spacing: with many apps the slots sit
             // close together and a full-size front orb swallows its neighbours.
-            CGFloat bigOrb = MIN(224.0 * kCardScale, (CGFloat)((w * 0.44) * kCardSpacing * slotAngle * 1.55));
+            CGFloat bigOrb = MIN(224.0 * kCardScale, (CGFloat)((w * 0.46) * kCardSpacing * slotAngle * 1.30));
             CGFloat smallOrb = 112.0 * kOrbSize;
             CGFloat sz = smallOrb + (bigOrb - smallOrb) * focusSmooth;
             itemW = sz;
@@ -924,7 +1070,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
             angleY = -theta * 0.78 * kWheelCurvature;
             depthScale = 0.62 + 0.38 * frontWeight;
         } else if (kLayoutMode == 2) {
-            CGFloat orbitR = (w * 0.44) * kCardSpacing;
+            CGFloat orbitR = (w * 0.46) * kCardSpacing;
             posX = (w * 0.5) + orbitR * sinT;
             posY = (h * 0.48) + (1.0 - cosT) * 18.0;
             transZ = (cosT - 1.0) * 145.0 * kWheelCurvature;
@@ -960,19 +1106,30 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         // Frosting for overlaps: the front item turns nearly opaque (its frosted glass
         // view blurs whatever sits behind it), so a neighbouring orb no longer ghosts
         // through it where the two overlap.
-        item.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.19 alpha:(0.86 + 0.12 * (CGFloat)frontWeight)];
+        CGFloat bgAlpha = 0.86 + 0.12 * (CGFloat)frontWeight;
+        NSInteger bgBucket = (NSInteger)lround(bgAlpha * 24.0);
+        if (bgBucket != item.lastBgAlphaBucket) {
+            item.lastBgAlphaBucket = bgBucket;
+            item.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.19 alpha:bgAlpha];
+        }
 
         // Border and glass rim share the item's own layer path & corner radius, and the rim
         // image is refitted to the item's exact bounds on every layout - one frame, one shape.
         item.glassRimOverlay.frame = CGRectMake(0, 0, itemW, itemH);
         if (kLiquidGlass && kGlowIntensity > 0.01) {
-            item.layer.borderWidth = 2.0;
-            item.layer.borderColor = CSDispersedGlowColor(MIN(0.95, 0.45 + kGlowIntensity * 0.50)).CGColor;
-            // The rim PNG's stroke is inset from its canvas edges, so on cards it drew a
-            // second, inner frame that never matched the layer border ('glass mask does
-            // not hug the border'). Cards use the single layer border only; round orbs
-            // keep the rim sheen.
-            item.glassRimOverlay.alpha = isCircular ? MIN(0.92, (0.18 + kGlowIntensity * 0.40) * (0.45 + kGlassSpecular * 0.65) * (0.55 + kGlassRefract * 0.55)) : 0.0;
+            // ONE border at a time (user's order): only the front item wears the blue
+            // border, fading in as it approaches the front. Side/back items are
+            // borderless, so borders can never cross or stack on each other again.
+            CGFloat borderWeight = MAX(0.0, MIN(1.0, ((CGFloat)frontWeight - 0.70) / 0.30));
+            item.layer.borderWidth = 2.0 * borderWeight;
+            item.layer.borderColor = [itemBorderColor colorWithAlphaComponent:itemBorderColor ? (CGColorGetAlpha(itemBorderColor.CGColor) * borderWeight) : 0.0].CGColor;
+            // The rim PNG's stroke is inset from its canvas edges, so wherever it was
+            // shown it drew a SECOND frame inside the layer border ('blue borders stack
+            // on each other, glass does not fit the frame'). It is now never shown:
+            // every item has exactly one frame - its layer border, same shape as its
+            // clipped glass. (The glass sliders still drive border colour/dispersion,
+            // halo and background frosting.)
+            item.glassRimOverlay.alpha = 0.0;
         } else {
             item.layer.borderWidth = 0.0;
             item.glassRimOverlay.alpha = 0.0;
@@ -1043,6 +1200,12 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     }
 
     CSInfiniteCarouselItem *frontItem = self.items[bestIdx];
+    if (frontItem) {
+        // Resting frame of the front slot: the entrance morph lands exactly here.
+        self.frontRestCenter = frontItem.center;
+        self.frontRestSize = frontItem.bounds.size;
+        self.frontRestRadius = frontItem.layer.cornerRadius;
+    }
     if (kTitlePosition == 0 && frontItem) {
         self.topHeaderPill.hidden = NO;
         self.topHeaderIcon.image = frontItem.iconImageView.image;
@@ -1073,6 +1236,8 @@ static void CSReloadCallback(CFNotificationCenterRef center,
         return;
     }
 
+    [self _cs_updateSpinBlur:(kMotionBlurOn ? MIN(0.30, fabs(self.angularVelocity) * 0.030) : 0.0)];
+
     if (self.isSnapping) {
         double diff = self.snapTargetAngle - self.spinAngle;
         self.spinAngle += diff * MIN(1.0, dt * 14.0);
@@ -1102,6 +1267,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
     CGPoint velocity = [pan velocityInView:self];
 
     if (pan.state == UIGestureRecognizerStateBegan) {
+        [self finishEntranceMorph];
         [self stopPhysics];
         // Rasterize items for the duration of the drag: per-frame shadow/blur redraws on
         // the CPU were a major source of carousel stutter.
@@ -1136,6 +1302,7 @@ static void CSReloadCallback(CFNotificationCenterRef center,
             self.spinAngle += deltaAngle;
             [pan setTranslation:CGPointZero inView:self];
             [self layoutCarousel3D];
+            [self _cs_updateSpinBlur:(kMotionBlurOn ? MIN(0.30, fabs((double)velocity.x) / 210.0 * 0.030) : 0.0)];
         }
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         for (CSInfiniteCarouselItem *item in self.items) item.layer.shouldRasterize = NO;
@@ -1590,7 +1757,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     targetView.alpha = kFadeIcons ? MAX(0.50, 1.0 - absT * 0.35) : 1.0;
     if (kTitlePosition == 1) targetView.alpha *= 0.78; // 'center (dim card)' behind our own title label
 
-    // 2.2.2: repositioning the native header never survived the system's own layout
+    // 2.2.5: repositioning the native header never survived the system's own layout
     // pass on device (headers stayed piled at the top in every classic mode, in the
     // user's 149s test video). The native header is now always hidden in classic too,
     // and CircleSwitcher draws its OWN title label inside the page view - it inherits
@@ -1716,13 +1883,13 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
                     [self _cs_setSwitcherActive:YES];
                 });
             }
-            // Immediately hide overlay as soon as user leaves App Switcher (to Home=1 or App=3)
-            if (toMode != 2) {
-                gSwitcherSettledOpen = NO;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self _cs_setSwitcherActive:NO];
-                });
-            }
+            // Leaving the switcher (to Home=1 or App=3): do NOT tear anything down here.
+            // Tearing down at transition BEGIN restored the native views for the entire
+            // exit animation - the user tapped, CircleSwitcher vanished, and the DEFAULT
+            // switcher rode the exit out. This was the #1 bug, and it survived earlier rounds
+            // because this hook raced (and undid) the tap handler's own reordering.
+            // Teardown is owned by transitionDidEnd below, when the switcher is already
+            // off-screen.
         }
     } @catch (NSException *e) {}
 }
@@ -1787,11 +1954,19 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
             stage.alpha = 1.0;
             kCSLastActivationTime = CACurrentMediaTime();
             stage.userInteractionEnabled = YES;
-            if (wasHidden && (CACurrentMediaTime() - kCSLastTransitionBeginTime) > 0.45) {
-                // Only run our own entrance when the stage was attached late (prefs change
-                // or fallback path). On an early attach the system's presentation
-                // animation already provides the motion - a second one reads as delay.
-                [stage triggerSafeEntranceMotionBlur];
+            if (wasHidden) {
+                if ((CACurrentMediaTime() - kCSLastTransitionBeginTime) <= 0.45) {
+                    // Early attach (the normal open): run the entrance morph. It rides
+                    // the system's own open animation - the front item shrinks from a
+                    // big rounded screen into its slot with speed-tracked blur - so
+                    // opening reads as one continuous motion instead of a pop + jerk.
+                    // Self-gated on the Motion Blur preference inside the method.
+                    [stage startEntranceMorph];
+                } else {
+                    // Late attach (prefs change or fallback path): no system animation
+                    // left to ride, keep the older soft entrance.
+                    [stage triggerSafeEntranceMotionBlur];
+                }
             }
         } else {
             // Safety fallback: if 0 apps found, keep native switcher 100% visible & interactive!
@@ -1827,7 +2002,7 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 - (void)_cs_dismissSwitcherToHome {
     gSwitcherSettledOpen = NO;
 
-    // 2.2.2: send the 'go home' command FIRST and tear the overlay down afterwards.
+    // 2.2.5: send the 'go home' command FIRST and tear the overlay down afterwards.
     // The old order restored the native switcher first, so whenever the home command
     // was slow (or a selector missed on this iOS) the user landed on the DEFAULT
     // switcher instead of the home screen after tapping empty space.
@@ -1867,39 +2042,45 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
     } @catch (NSException *e) {}
 
     if (sentHome) {
-        // The system dismissal runs with the overlay still covering the native
-        // switcher; tear down shortly after so no native frame is ever revealed.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self _cs_setSwitcherActive:NO];
-        });
+        // Teardown is owned by the transition-DidEnd hook: the stage stays on top for
+        // the whole exit animation and is hidden only once the switcher is off-screen.
+        // (The 2.2.5 version tore down on a 0.30s timer here, which could also fire
+        // after a fast re-open and kill the fresh stage.)
+        [self _cs_scheduleExitWatchdog];
     } else {
         [self _cs_setSwitcherActive:NO];
     }
 }
 
 %new
+- (void)_cs_scheduleExitWatchdog {
+    kCSLastExitRequestTime = CACurrentMediaTime();
+    CFTimeInterval token = kCSLastExitRequestTime;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (kCSLastExitRequestTime != token) return; // a newer exit/open superseded this one
+        if (!gSwitcherSettledOpen) return;           // the transition ran; DidEnd cleaned up
+        // The exit never actually started (command swallowed): give the switcher back
+        // instead of leaving a frozen overlay on screen.
+        CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
+        if (stage && !stage.hidden) stage.userInteractionEnabled = YES;
+    });
+}
+
+%new
 - (void)_cs_activateAppLayout:(id)appLayout bundleID:(NSString *)bundleID {
     if (bundleID.length == 0) return;
 
-    // Activate THROUGH the system in the SAME frame. The old code tore the overlay down
-    // first and launched the app async on the next runloop: the native switcher flashed
-    // on screen, then its card animation restarted from a reset transform - the stutter
-    // and the 'CircleSwitcher exits but the default switcher is still there' effect.
-    // Now the native views are restored in the same frame (so the system can animate the
-    // real card) while the overlay cross-fades out on top of that very animation.
-    gSwitcherSettledOpen = NO;
-
+    // Activate THROUGH the system in the SAME frame, and leave the overlay exactly as
+    // it is. Restoring the native views here (the pre-2.2.5 behaviour) revealed the
+    // default switcher for the whole exit animation - the user's #1 complaint. The
+    // stage now rides the switcher view out, and the transition-DidEnd hook performs
+    // the teardown once everything is off-screen.
     CSInfiniteCarouselStageView *stage = objc_getAssociatedObject(self, kCSCarouselStageKey);
     if (stage) {
         [stage stopPhysics];
         stage.userInteractionEnabled = NO;
-        CSSetNativeSwitcherViewsHidden(self.view, stage, NO);
-        [UIView animateWithDuration:0.18 animations:^{
-            stage.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            stage.hidden = YES;
-        }];
     }
+    [self _cs_scheduleExitWatchdog];
 
     BOOL activated = NO;
     @try {
@@ -1990,13 +2171,8 @@ static void CSSetNativeSwitcherViewsHidden(UIView *root, UIView *stage, BOOL hid
 - (void)layoutStateTransitionCoordinator:(id)coordinator transitionDidBeginWithTransitionContext:(id)context {
     %orig(coordinator, context);
     if (gPrimarySwitcherVC) return; // the VC hook already handles this transition - do not handle it twice
-    @try {
-        id toModeObj = [context valueForKeyPath:@"toLayoutState.unlockedEnvironmentMode"];
-        if (toModeObj && [toModeObj respondsToSelector:@selector(integerValue)] && [toModeObj integerValue] != 2) {
-            gSwitcherSettledOpen = NO;
-            if (gPrimarySwitcherVC) [gPrimarySwitcherVC _cs_handlePrefsOrStateChanged];
-        }
-    } @catch (NSException *e) {}
+    // Exit teardown is owned by transitionDidEnd (see the VC hook): nothing to do at
+    // Begin, so the overlay can never be stripped in the middle of an exit animation.
 }
 
 - (void)layoutStateTransitionCoordinator:(id)coordinator transitionDidEndWithTransitionContext:(id)context {

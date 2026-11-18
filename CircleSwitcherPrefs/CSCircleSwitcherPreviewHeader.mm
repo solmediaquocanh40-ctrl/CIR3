@@ -358,8 +358,10 @@ static UIColor *CSPreviewColorFromHex(NSString *hexStr, CGFloat alpha) {
     self.backdropImageView.tintColor = [glowColor colorWithAlphaComponent:0.26f * glow];
 
     // 3D Hologram Base Ring
-    BOOL showBase = baseEnabled && (mode == 0 || mode == 1 || mode == 2);
-    self.hologramBaseView.hidden = !showBase;
+    // Hologram base removed from the tweak (user's order) - the preview no longer
+    // shows it either.
+    BOOL showBase = NO && baseEnabled; // base removed - kept NO regardless of the old pref
+    self.hologramBaseView.hidden = YES;
     if (showBase) {
         CGFloat ringDim = MIN(w * 0.72f, 220.0f) * baseScale;
         self.hologramBaseView.bounds = CGRectMake(0, 0, ringDim, ringDim);
